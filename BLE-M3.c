@@ -34,8 +34,11 @@ static inline long long now_ms(void){
   return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000;
 }
 static inline void shf(const char *fmt, ...) {
-  char cmd[256]; va_list ap; va_start(ap, fmt);
-  vsnprintf(cmd, sizeof(cmd), ap); va_end(ap);
+  char cmd[256];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(cmd, sizeof(cmd), fmt, ap);
+  va_end(ap);
   system(cmd);
 }
 
