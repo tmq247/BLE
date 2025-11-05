@@ -1,5 +1,5 @@
-// blem3_learn_adb.c — Liệt kê thiết bị (scan /dev/input và fallback getevent -S),
-// học chuỗi hành động BLE-M3, xác nhận & gán 1 key (F1..F12). Chạy tốt qua adb shell.
+// blem3_learn_adb.c — Học phím BLE-M3 qua adb shell: liệt kê thiết bị,
+// chọn theo số, gom một chuỗi hành động -> 1 signature duy nhất và cho gán F-key.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -12,11 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #define MAX_DEV 64
+#define MAX_SEL 8
 #define HOLD_MS     350
 #define GAP_MS      120
 #define DEADZONE    2
@@ -40,7 +40,7 @@ static inline void shf(const char *fmt, ...) {
   system(cmd);
 }
 
-/* ---------- Liệt kê: scan /dev/input ---------- */
+/* ---------------- Liệt kê thiết bị ---------------- */
 static void scan_by_dir(void){
   ndev = 0;
   for (int i=0;i<64;i++){
@@ -55,8 +55,6 @@ static void scan_by_dir(void){
     if (ndev >= MAX_DEV) break;
   }
 }
-
-/* ---------- Fallback: parse `getevent -S` ---------- */
 static void trim(char *s){
   size_t n=strlen(s);
   while (n && (s[n-1]=='\n'||s[n-1]=='\r'||s[n-1]==' '||s[n-1]=='\t')) s[--n]=0;
@@ -68,26 +66,17 @@ static void scan_by_getevent(void){
   char line[512], last_name[256]="";
   while (fgets(line,sizeof(line),fp)){
     trim(line);
-    // Examples from `getevent -S`:
-    // add device 1: /dev/input/event12
-    //   name:     "BLE-M3 Mouse"
     if (strncmp(line, "add device", 10)==0){
       char path[128]="";
       char *p=strstr(line, "/dev/input/event");
       if (p){
         strncpy(path, p, sizeof(path)-1);
         path[sizeof(path)-1]=0;
-        // chờ dòng name ngay sau
         if (fgets(line,sizeof(line),fp)){
           trim(line);
           char *q=strstr(line,"name:");
           if (q){
-            q=strchr(line,'"'); // mở quote
-            if (q){
-              q++;
-              char *r=strchr(q,'"');
-              if (r){ *r=0; snprintf(last_name,sizeof(last_name),"%s",q); }
-            }
+            q=strchr(line,'"'); if (q){ q++; char *r=strchr(q,'"'); if (r){ *r=0; snprintf(last_name,sizeof(last_name),"%s",q); } }
           }
         }
         if (last_name[0]){
@@ -101,8 +90,27 @@ static void scan_by_getevent(void){
   }
   pclose(fp);
 }
+static void list_devices_print(void){
+  printf("== Input devices ==\n");
+  for (int i=0;i<ndev;i++){
+    printf("[%d] %-28s %s\n", i, devs[i].name, devs[i].path);
+  }
+}
 
-/* ---------- Mở & GRAB ---------- */
+/* ---------------- Mở & GRAB ---------------- */
+typedef struct {
+  int fd;
+  char name[256];
+  char path[64];
+  int evno;   // số eventXX
+  char tag[8]; // "E11" / "E12" ...
+} SelFD;
+
+static int parse_evno(const char* path){
+  int n=-1; const char* p=strrchr(path,'t'); // ...event12
+  if (p) n=atoi(p+1);
+  return n;
+}
 static int open_grab_path(const char *path){
   int fd = open(path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) return -1;
@@ -110,107 +118,144 @@ static int open_grab_path(const char *path){
   return fd;
 }
 
-/* ---------- Detect chuỗi hành động ---------- */
+/* ---------------- Detect 1 chuỗi -> signature duy nhất ---------------- */
 typedef struct {
-  char action[32];     // UP_TAP, DOWN_HOLD, LEFT_TAP, RIGHT_TAP, CAMERA_TAP/HOLD, UNKNOWN
-  char signature[64];  // khóa duy nhất để gán phím
+  char action[32];     // label người đọc
+  char signature[64];  // KEY duy nhất để gán
 } Detect;
 
-static void detect_sequence(int *fds, int nfds, Detect *out){
-  long long start = 0, last = 0, down_t0 = 0;
-  int dx = 0, dy = 0;
-  int saw_btn = 0, btn_down = 0, btn_up = 0;
+static void detect_sequence(SelFD *sfds, int nfds, Detect *out){
+  // Tập hợp các tính chất thu được cho từng fd (để biết đến từ E11 hay E12)
+  typedef struct {
+    int dx, dy;
+    int saw_btn, btn_down, btn_up;
+    int last_key_code;   // mã EV_KEY cuối (vd KEY_VOLUMEDOWN)
+    int saw_msc;         // có EV_MSC/MSC_SCAN?
+    unsigned int msc_val;
+    long long down_t0;
+    long long last_time;
+    long long start_time;
+  } Acc;
+  Acc acc[MAX_SEL]; memset(acc,0,sizeof(acc));
 
-  struct pollfd pf[8];
-  for (int i=0;i<nfds;i++){ pf[i].fd=fds[i]; pf[i].events=POLLIN; pf[i].revents=0; }
+  struct pollfd pf[MAX_SEL];
+  for(int i=0;i<nfds;i++){ pf[i].fd=sfds[i].fd; pf[i].events=POLLIN; pf[i].revents=0; }
 
+  long long last_any = 0;
   for(;;){
-    int r = poll(pf, nfds, 3000);        // tối đa 3s chờ lần bấm đầu
-    if (r <= 0) break;
-    for (int i=0;i<nfds;i++){
+    int r = poll(pf, nfds, 3000);     // chờ lần bấm đầu tối đa 3s
+    if (r<=0) break;
+    for(int i=0;i<nfds;i++){
       if (!(pf[i].revents & POLLIN)) continue;
       struct input_event ev; ssize_t n = read(pf[i].fd, &ev, sizeof(ev));
       if (n != sizeof(ev)) continue;
-      if (start==0) start = now_ms();
-      last = now_ms();
+      long long t = now_ms();
+      if (acc[i].start_time==0) acc[i].start_time=t;
+      acc[i].last_time=t; last_any=t;
 
-      if (ev.type == EV_KEY && ev.code == BTN_MOUSE){
-        saw_btn = 1;
-        if (ev.value == 1){ btn_down = 1; down_t0 = now_ms(); }
-        if (ev.value == 0){ btn_up = 1; }
-      } else if (ev.type == EV_REL){
-        if (ev.code == REL_X){ if (abs(ev.value) >= DEADZONE) dx += ev.value; }
-        if (ev.code == REL_Y){ if (abs(ev.value) >= DEADZONE) dy += ev.value; }
+      if (ev.type==EV_KEY){
+        acc[i].last_key_code = ev.code;
+        if (ev.code==BTN_MOUSE){
+          acc[i].saw_btn=1;
+          if (ev.value==1){ acc[i].btn_down=1; acc[i].down_t0=t; }
+          if (ev.value==0){ acc[i].btn_up=1; }
+        }
+      } else if (ev.type==EV_MSC && ev.code==MSC_SCAN){
+        acc[i].saw_msc=1; acc[i].msc_val = (unsigned int)ev.value;
+      } else if (ev.type==EV_REL){
+        if (ev.code==REL_X){ if (abs(ev.value)>=DEADZONE) acc[i].dx += ev.value; }
+        if (ev.code==REL_Y){ if (abs(ev.value)>=DEADZONE) acc[i].dy += ev.value; }
       }
 
-      if (ev.type == EV_SYN && ev.code == SYN_REPORT){
-        long long tnow = now_ms();
-        if (tnow - last > GAP_MS) goto done;
+      if (ev.type==EV_SYN && ev.code==SYN_REPORT){
+        // khoảng lặng cho từng fd: xử lý ở ngoài theo last_any
       }
     }
-    if (start && (now_ms() - last > GAP_MS)) break;
+    if (last_any && (now_ms() - last_any > GAP_MS)) break;
   }
 
-done:
-  memset(out, 0, sizeof(*out));
-  if (saw_btn){
-    long long dt = (btn_down && btn_up) ? (last - down_t0) : 0;
-    if (dt >= HOLD_MS){
-      snprintf(out->action, sizeof(out->action), "CAMERA_HOLD");
-      snprintf(out->signature, sizeof(out->signature), "BTN_MOUSE:HOLD");
-    } else {
-      snprintf(out->action, sizeof(out->action), "CAMERA_TAP");
-      snprintf(out->signature, sizeof(out->signature), "BTN_MOUSE:TAP");
+  // Ưu tiên: KEY/MSC từ E11 (Consumer Control) vì chúng là phím media/volume rõ ràng
+  for(int i=0;i<nfds;i++){
+    if (strstr(sfds[i].name,"Consumer Control") || strstr(sfds[i].name,"Consumer")){
+      if (acc[i].saw_msc){
+        snprintf(out->action,sizeof(out->action),"MSC_SCAN");
+        snprintf(out->signature,sizeof(out->signature),"%s:MSC:%08x", sfds[i].tag, acc[i].msc_val);
+        return;
+      }
+      if (acc[i].last_key_code){
+        // Ví dụ KEY_POWER, KEY_VOLUMEDOWN/UP...
+        snprintf(out->action,sizeof(out->action),"KEY_%d", acc[i].last_key_code);
+        snprintf(out->signature,sizeof(out->signature),"%s:KEY:%d", sfds[i].tag, acc[i].last_key_code);
+        return;
+      }
     }
-    return;
   }
 
-  if (abs(dx) > abs(dy)){
-    if (dx > 0){
-      snprintf(out->action, sizeof(out->action), "RIGHT_TAP");
-      snprintf(out->signature, sizeof(out->signature), "REL:X:+");
-    } else if (dx < 0){
-      snprintf(out->action, sizeof(out->action), "LEFT_TAP");
-      snprintf(out->signature, sizeof(out->signature), "REL:X:-");
-    } else {
-      snprintf(out->action, sizeof(out->action), "UNKNOWN");
-      snprintf(out->signature, sizeof(out->signature), "UNKNOWN");
-    }
-  } else if (abs(dy) > 0){
-    long long dur = last - start;
-    if (dy < 0){
-      if (dur >= HOLD_MS){
-        snprintf(out->action, sizeof(out->action), "UP_HOLD");
-        snprintf(out->signature, sizeof(out->signature), "REL:Y:-:HOLD");
+  // Tiếp theo: BTN_MOUSE (camera) ở E12 (Mouse)
+  for(int i=0;i<nfds;i++){
+    if (acc[i].saw_btn){
+      long long dt = (acc[i].btn_down && acc[i].btn_up) ? (acc[i].last_time - acc[i].down_t0) : 0;
+      if (dt >= HOLD_MS){
+        snprintf(out->action,sizeof(out->action),"CAMERA_HOLD");
+        snprintf(out->signature,sizeof(out->signature),"%s:BTN_MOUSE:HOLD", sfds[i].tag);
       } else {
-        snprintf(out->action, sizeof(out->action), "UP_TAP");
-        snprintf(out->signature, sizeof(out->signature), "REL:Y:-:TAP");
+        snprintf(out->action,sizeof(out->action),"CAMERA_TAP");
+        snprintf(out->signature,sizeof(out->signature),"%s:BTN_MOUSE:TAP", sfds[i].tag);
       }
-    } else {
-      if (dur >= HOLD_MS){
-        snprintf(out->action, sizeof(out->action), "DOWN_HOLD");
-        snprintf(out->signature, sizeof(out->signature), "REL:Y:+:HOLD");
-      } else {
-        snprintf(out->action, sizeof(out->action), "DOWN_TAP");
-        snprintf(out->signature, sizeof(out->signature), "REL:Y:+:TAP");
-      }
+      return;
     }
-  } else {
-    snprintf(out->action, sizeof(out->action), "UNKNOWN");
-    snprintf(out->signature, sizeof(out->signature), "UNKNOWN");
   }
+
+  // Cuối cùng: D-pad bằng REL_X/Y (Mouse)
+  for(int i=0;i<nfds;i++){
+    int dx = acc[i].dx, dy = acc[i].dy;
+    if (dx==0 && dy==0) continue;
+    long long dur = acc[i].last_time - acc[i].start_time;
+    if (abs(dx) > abs(dy)){
+      if (dx > 0){
+        snprintf(out->action,sizeof(out->action),"RIGHT_TAP");
+        snprintf(out->signature,sizeof(out->signature),"%s:REL:X:+", sfds[i].tag);
+      } else {
+        snprintf(out->action,sizeof(out->action),"LEFT_TAP");
+        snprintf(out->signature,sizeof(out->signature),"%s:REL:X:-", sfds[i].tag);
+      }
+      return;
+    }else{
+      if (dy < 0){
+        if (dur>=HOLD_MS){
+          snprintf(out->action,sizeof(out->action),"UP_HOLD");
+          snprintf(out->signature,sizeof(out->signature),"%s:REL:Y:-:HOLD", sfds[i].tag);
+        }else{
+          snprintf(out->action,sizeof(out->action),"UP_TAP");
+          snprintf(out->signature,sizeof(out->signature),"%s:REL:Y:-:TAP", sfds[i].tag);
+        }
+      }else{
+        if (dur>=HOLD_MS){
+          snprintf(out->action,sizeof(out->action),"DOWN_HOLD");
+          snprintf(out->signature,sizeof(out->signature),"%s:REL:Y:+:HOLD", sfds[i].tag);
+        }else{
+          snprintf(out->action,sizeof(out->action),"DOWN_TAP");
+          snprintf(out->signature,sizeof(out->signature),"%s:REL:Y:+:TAP", sfds[i].tag);
+        }
+      }
+      return;
+    }
+  }
+
+  // Không nhận dạng được
+  snprintf(out->action,sizeof(out->action),"UNKNOWN");
+  snprintf(out->signature,sizeof(out->signature),"UNKNOWN");
 }
 
-/* ---------- Bảng gán signature -> keycode ---------- */
+/* ---------------- Bảng gán signature -> keycode ---------------- */
 typedef struct {
   char sig[64];
   int  keycode;  // 131..142 = F1..F12
   char name[16];
 } MapItem;
-
 #define MAX_MAP 64
 static MapItem maps[MAX_MAP];
-static int nmap = 0;
+static int nmap=0;
 
 static const char* keyname(int code){
   switch(code){
@@ -222,121 +267,97 @@ static const char* keyname(int code){
   }
 }
 static int find_map(const char *sig){
-  for (int i=0;i<nmap;i++) if (strcmp(maps[i].sig, sig)==0) return i;
+  for (int i=0;i<nmap;i++) if (!strcmp(maps[i].sig, sig)) return i;
   return -1;
 }
 
-/* ---------- RUN loop ---------- */
-static void run_loop(int *fds, int nfds){
-  printf("\n[RUN] Nhấn phím trên remote — tôi in & phát key đã gán. (Ctrl+C để thoát)\n");
-  long long last_emit = 0;
-  while (1){
-    Detect d = {0};
-    detect_sequence(fds, nfds, &d);
-    if (strcmp(d.signature,"")==0) continue;
-    int idx = find_map(d.signature);
-    if (idx < 0){
-      printf("→ %s (sig=%s) CHƯA GÁN\n", d.action, d.signature);
-      continue;
-    }
+/* ---------------- RUN loop ---------------- */
+static void run_loop(SelFD *sfds, int nfds){
+  printf("\n[RUN] Nhấn phím — tôi in & phát key đã gán. (Ctrl+C để thoát)\n");
+  long long last_emit=0;
+  while(1){
+    Detect d={0};
+    detect_sequence(sfds,nfds,&d);
+    if (!d.signature[0]) continue;
+    int idx=find_map(d.signature);
+    if (idx<0){ printf("→ %s (sig=%s) CHƯA GÁN\n", d.action, d.signature); continue; }
     if (now_ms()-last_emit < COOLDOWN_MS) continue;
-    last_emit = now_ms();
+    last_emit=now_ms();
     printf("→ %s  =>  %s (%d)\n", d.action, maps[idx].name, maps[idx].keycode);
     char cmd[64]; snprintf(cmd,sizeof(cmd),"input keyevent %d", maps[idx].keycode);
     shf("%s", cmd);
   }
 }
 
-static void list_devices_print(void){
-  printf("== Input devices ==\n");
-  for (int i=0;i<ndev;i++){
-    printf("[%d] %-26s %s\n", i, devs[i].name, devs[i].path);
-  }
-}
-
-/* ---------- main ---------- */
+/* ---------------- main ---------------- */
 int main(void){
-  setvbuf(stdout, NULL, _IONBF, 0);
-  setvbuf(stderr, NULL, _IONBF, 0);
-  signal(SIGINT, SIG_DFL); signal(SIGTERM, SIG_DFL);
+  setvbuf(stdout,NULL,_IONBF,0);
+  setvbuf(stderr,NULL,_IONBF,0);
 
-  // 1) Liệt kê: ưu tiên scan /dev/input, nếu không có → fallback getevent -S
+  // Liệt kê (scan trực tiếp, nếu rỗng thì fallback getevent -S)
   scan_by_dir();
-  if (ndev == 0) {
-    scan_by_getevent();
-  }
-  if (ndev == 0){
-    fprintf(stderr,"Không liệt kê được thiết bị input. Hãy chạy từ adb shell.\n");
-    return 1;
-  }
-  list_devices_print();
+  if (ndev==0) scan_by_getevent();
+  if (ndev==0){ fprintf(stderr,"Không liệt kê được thiết bị input.\n"); return 1; }
 
+  printf("== Input devices ==\n");
+  for (int i=0;i<ndev;i++) printf("[%d] %-28s %s\n", i, devs[i].name, devs[i].path);
   printf("\nChọn thiết bị bằng chỉ số (cách nhau bởi dấu cách), rồi Enter.\n");
-  printf("Gợi ý BLE-M3: chọn cả \"BLE-M3 Mouse\" và \"BLE-M3 Consumer Control\".\n> ");
+  printf("Gợi ý: chọn cả \"BLE-M3 Mouse\" và \"BLE-M3 Consumer Control\".\n> ");
 
-  // 2) Lựa chọn
-  int sel[4]; int nsel=0;
-  char line[128]; if (!fgets(line,sizeof(line),stdin)) return 1;
-  char *tok=strtok(line," \t\r\n");
-  while(tok && nsel<4){ sel[nsel++]=atoi(tok); tok=strtok(NULL," \t\r\n"); }
+  // Đọc lựa chọn
+  int sel_idx[MAX_SEL], nsel=0; char line[256];
+  if (!fgets(line,sizeof(line),stdin)) return 1;
+  for (char *p=strtok(line," \t\r\n"); p && nsel<MAX_SEL; p=strtok(NULL," \t\r\n"))
+    sel_idx[nsel++]=atoi(p);
   if (nsel==0){ printf("Không chọn thiết bị nào.\n"); return 1; }
 
-  // 3) Mở & GRAB (theo path đã in)
-  int fds[4]; int nfds=0;
+  // Mở & GRAB
+  SelFD sfds[MAX_SEL]; int nfds=0;
   for (int i=0;i<nsel;i++){
-    if (sel[i] < 0 || sel[i] >= ndev) continue;
-    int fd = open_grab_path(devs[sel[i]].path);
-    if (fd>=0){ fds[nfds++]=fd; printf("Grabbed: %s (%s)\n", devs[sel[i]].path, devs[sel[i]].name); }
-    else printf("Không mở được: %s (%s)\n", devs[sel[i]].path, devs[sel[i]].name);
+    int k=sel_idx[i]; if (k<0||k>=ndev) continue;
+    int fd=open_grab_path(devs[k].path);
+    if (fd<0){ printf("Không mở được: %s\n", devs[k].path); continue; }
+    sfds[nfds].fd=fd;
+    snprintf(sfds[nfds].name,sizeof(sfds[nfds].name),"%s", devs[k].name);
+    snprintf(sfds[nfds].path,sizeof(sfds[nfds].path),"%s", devs[k].path);
+    sfds[nfds].evno = parse_evno(devs[k].path);
+    snprintf(sfds[nfds].tag,sizeof(sfds[nfds].tag),"E%d", sfds[nfds].evno);
+    printf("Grabbed: %s (%s)  tag=%s\n", sfds[nfds].path, sfds[nfds].name, sfds[nfds].tag);
+    nfds++;
   }
   if (nfds==0){ printf("Không mở được thiết bị nào.\n"); return 1; }
 
-  // 4) Vòng học/gán
-  while (1){
+  // Học / gán
+  for(;;){
     Detect d1={0}, d2={0};
     printf("\n[LEARN] Bấm 1 phím trên remote...\n");
-    detect_sequence(fds, nfds, &d1);
-    if (strcmp(d1.signature,"")==0){ printf("Không nhận được chuỗi.\n"); continue; }
-    printf("→ Tôi thấy: %s (sig=%s)\n", d1.action, d1.signature);
+    detect_sequence(sfds,nfds,&d1);
+    if (!d1.signature[0]){ printf("Không nhận được chuỗi.\n"); continue; }
+    printf("→ Thấy: %s (sig=%s)\n", d1.action, d1.signature);
 
     printf("Bấm lại phím đó để xác nhận...\n");
-    detect_sequence(fds, nfds, &d2);
-    if (strcmp(d1.signature, d2.signature)!=0){
+    detect_sequence(sfds,nfds,&d2);
+    if (strcmp(d1.signature,d2.signature)!=0){
       printf("Không khớp! Lần 2: %s (sig=%s)\n", d2.action, d2.signature);
       continue;
     }
     printf("OK, đã khớp: %s\n", d1.action);
 
-    // Gán keycode
-    printf("Nhập mã phím để gán (131..142=F1..F12), hoặc 's' để bỏ qua: ");
+    // Nhập keycode
+    printf("Nhập mã phím để gán (131..142 = F1..F12), hoặc 's' để bỏ qua: ");
     if (!fgets(line,sizeof(line),stdin)) break;
-    if (line[0]=='s' || line[0]=='S') continue;
-    int code = atoi(line);
-    if (code<=0){ printf("Mã không hợp lệ.\n"); continue; }
+    if (line[0]=='s'||line[0]=='S') continue;
+    int code=atoi(line); if (code<=0){ printf("Mã không hợp lệ.\n"); continue; }
 
-    // lưu map
-    int idx=-1; for (int i=0;i<nmap;i++) if (!strcmp(maps[i].sig, d1.signature)) { idx=i; break; }
-    if (idx<0 && nmap<MAX_MAP){ idx=nmap++; snprintf(maps[idx].sig,sizeof(maps[idx].sig),"%s",d1.signature); }
+    int idx=find_map(d1.signature);
+    if (idx<0 && nmap<MAX_MAP){ idx=nmap++; snprintf(maps[idx].sig,sizeof(maps[idx].sig),"%s", d1.signature); }
     if (idx<0){ printf("Hết slot map.\n"); continue; }
-    maps[idx].keycode = code;
-    snprintf(maps[idx].name, sizeof(maps[idx].name), "%s",
-      (code>=131 && code<=142)? (const char*[]){"?","?","?","?","?","?","?","?","?","?","?","?"}[0] : "?");
-    // tên đẹp
-    switch(code){
-      case 131: strcpy(maps[idx].name,"F1"); break;  case 132: strcpy(maps[idx].name,"F2"); break;
-      case 133: strcpy(maps[idx].name,"F3"); break;  case 134: strcpy(maps[idx].name,"F4"); break;
-      case 135: strcpy(maps[idx].name,"F5"); break;  case 136: strcpy(maps[idx].name,"F6"); break;
-      case 137: strcpy(maps[idx].name,"F7"); break;  case 138: strcpy(maps[idx].name,"F8"); break;
-      case 139: strcpy(maps[idx].name,"F9"); break;  case 140: strcpy(maps[idx].name,"F10"); break;
-      case 141: strcpy(maps[idx].name,"F11"); break; case 142: strcpy(maps[idx].name,"F12"); break;
-      default: snprintf(maps[idx].name,sizeof(maps[idx].name),"KEY_%d",code); break;
-    }
-
+    maps[idx].keycode=code; snprintf(maps[idx].name,sizeof(maps[idx].name),"%s", keyname(code));
     printf("→ GÁN: %s  =>  %s (%d)\n", d1.action, maps[idx].name, maps[idx].keycode);
 
-    // Test ngay
-    printf("Bấm lại phím vừa gán để kiểm tra...\n");
-    Detect dt={0}; detect_sequence(fds, nfds, &dt);
+    // Test nhanh
+    printf("Bấm lại để kiểm tra (sẽ phát key nếu khớp)...\n");
+    Detect dt={0}; detect_sequence(sfds,nfds,&dt);
     if (!strcmp(dt.signature,d1.signature)){
       printf("Khớp! Phát: %s (%d)\n", maps[idx].name, maps[idx].keycode);
       char cmd[64]; snprintf(cmd,sizeof(cmd),"input keyevent %d", maps[idx].keycode);
@@ -345,13 +366,13 @@ int main(void){
       printf("Không khớp khi test (thấy %s / %s)\n", dt.action, dt.signature);
     }
 
-    // Chọn vào RUN hay học tiếp
-    printf("\nNhập 'r' để vào RUN, 'q' để thoát, phím khác để học tiếp: ");
+    // Vào RUN hay học tiếp
+    printf("\nNhập 'r' để RUN, 'q' để thoát, phím khác để học tiếp: ");
     if (!fgets(line,sizeof(line),stdin)) break;
-    if (line[0]=='r' || line[0]=='R'){ run_loop(fds,nfds); }
-    else if (line[0]=='q' || line[0]=='Q') break;
+    if (line[0]=='r'||line[0]=='R') run_loop(sfds,nfds);
+    else if (line[0]=='q'||line[0]=='Q') break;
   }
 
-  for (int i=0;i<nfds;i++){ ioctl(fds[i],EVIOCGRAB,0); close(fds[i]); }
+  for (int i=0;i<nfds;i++){ ioctl(sfds[i].fd,EVIOCGRAB,0); close(sfds[i].fd); }
   return 0;
 }
