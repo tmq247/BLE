@@ -256,6 +256,8 @@ static void list_devices_print(void){
 
 /* ---------- main ---------- */
 int main(void){
+  setvbuf(stdout, NULL, _IONBF, 0);
+  setvbuf(stderr, NULL, _IONBF, 0);
   signal(SIGINT, SIG_DFL); signal(SIGTERM, SIG_DFL);
 
   // 1) Liệt kê: ưu tiên scan /dev/input, nếu không có → fallback getevent -S
