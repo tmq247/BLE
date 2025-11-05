@@ -88,37 +88,38 @@ static void on_mouse_event(struct input_event *e){
   static long long last_emit = 0;
   static long long press_t0 = 0;
   static int dx = 0, dy = 0;
-  static int pressed = 0;
+  static int btn_down = 0;
   long long t = now_ms();
 
-  // --- lọc nhiễu REL quá nhỏ ---
+  // Bỏ nhiễu chuột quá nhỏ
   if (e->type == EV_REL) {
-    if (abs(e->value) < 2) return; // bỏ nhiễu ±1
+    if (abs(e->value) < 2) return;
     if (e->code == REL_X) dx += e->value;
     if (e->code == REL_Y) dy += e->value;
     return;
   }
 
-  // --- nút giữa thực ---
+  // Chỉ xử lý khi có nhấn/thả BTN_MOUSE
   if (e->type == EV_KEY && e->code == BTN_MOUSE) {
     if (e->value == 1) {
-      pressed = 1;
+      btn_down = 1;
       press_t0 = t;
-    } else if (e->value == 0) {
-      pressed = 0;
+    } else if (e->value == 0 && btn_down) {
+      btn_down = 0;
       long long dt = t - press_t0;
-      if (dt > 30 && dt < HOLD_MS) sh(EMIT_CENTER_TAP);
-      else if (dt >= HOLD_MS)      sh(EMIT_CENTER_HOLD);
+      if (dt >= 400) sh(EMIT_CAMERA_HOLD); // Giữ lâu → mở camera
+      else sh(EMIT_CAMERA_TAP);            // Nhấn ngắn → chụp ảnh
     }
+    dx = dy = 0;
+    last_emit = t;
     return;
   }
 
-  // --- gom theo SYN_REPORT ---
+  // Gom hướng mỗi 100ms, tránh spam
   if (e->type == EV_SYN && e->code == SYN_REPORT) {
-    if (t - last_emit < 100) return; // tránh double-trigger
+    if (t - last_emit < 100) return;
     last_emit = t;
 
-    // xác định hướng
     if (abs(dx) > abs(dy)) {
       if (dx > 2)      sh(EMIT_RIGHT_TAP);
       else if (dx < -2) sh(EMIT_LEFT_TAP);
@@ -126,11 +127,9 @@ static void on_mouse_event(struct input_event *e){
       if (dy < -2)     sh(EMIT_UP_TAP);
       else if (dy > 2) sh(EMIT_DOWN_TAP);
     }
-
     dx = dy = 0;
   }
 }
-
 int main(int argc,char**argv){
   signal(SIGINT,stop);signal(SIGTERM,stop);
   int fd_cons=-1,fd_mouse=-1;
