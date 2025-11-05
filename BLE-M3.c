@@ -85,50 +85,49 @@ static inline void end_hold_if_idle(long long now){
 }
 
 static void on_mouse_event(struct input_event *e){
-  long long now=now_ms(); if(win_t0==0)win_t0=now;
-  if(e->type==EV_REL||(e->type==EV_KEY&&e->code==BTN_MOUSE))last_activity=now;
+  static long long last_emit = 0;
+  static long long press_t0 = 0;
+  static int dx = 0, dy = 0;
+  static int pressed = 0;
+  long long t = now_ms();
 
-  // Nút giữa
-  if(e->type==EV_KEY&&e->code==BTN_MOUSE){
-    if(e->value==1){middle_down=1;middle_t0=now;}
-    else if(e->value==0){
-      long long dt=now-middle_t0;
-      middle_down=0;
-      if(dt>=HOLD_MS)sh(EMIT_CENTER_HOLD);
-      else           sh(EMIT_CENTER_TAP);
+  // --- lọc nhiễu REL quá nhỏ ---
+  if (e->type == EV_REL) {
+    if (abs(e->value) < 2) return; // bỏ nhiễu ±1
+    if (e->code == REL_X) dx += e->value;
+    if (e->code == REL_Y) dy += e->value;
+    return;
+  }
+
+  // --- nút giữa thực ---
+  if (e->type == EV_KEY && e->code == BTN_MOUSE) {
+    if (e->value == 1) {
+      pressed = 1;
+      press_t0 = t;
+    } else if (e->value == 0) {
+      pressed = 0;
+      long long dt = t - press_t0;
+      if (dt > 30 && dt < HOLD_MS) sh(EMIT_CENTER_TAP);
+      else if (dt >= HOLD_MS)      sh(EMIT_CENTER_HOLD);
     }
     return;
   }
 
-  // D-pad dịch chuyển
-  if(e->type==EV_REL){
-    if(e->code==REL_X)dx_sum+=e->value;
-    if(e->code==REL_Y)dy_sum+=e->value;
-    return;
-  }
+  // --- gom theo SYN_REPORT ---
+  if (e->type == EV_SYN && e->code == SYN_REPORT) {
+    if (t - last_emit < 100) return; // tránh double-trigger
+    last_emit = t;
 
-  if(e->type==EV_SYN&&e->code==SYN_REPORT){
-    // lặp volume khi giữ
-    if(hold_mode==HM_VOL_UP||hold_mode==HM_VOL_DOWN){
-      if(now-last_repeat_ms>=REPEAT_MS){
-        sh(hold_mode==HM_VOL_UP?EMIT_UP_HOLD:EMIT_DOWN_HOLD);
-        last_repeat_ms=now;
-      }
+    // xác định hướng
+    if (abs(dx) > abs(dy)) {
+      if (dx > 2)      sh(EMIT_RIGHT_TAP);
+      else if (dx < -2) sh(EMIT_LEFT_TAP);
+    } else if (abs(dy) > 0) {
+      if (dy < -2)     sh(EMIT_UP_TAP);
+      else if (dy > 2) sh(EMIT_DOWN_TAP);
     }
-    end_hold_if_idle(now);
 
-    if(now-win_t0>WINDOW_MS){
-      if(!middle_down&&hold_mode==HM_NONE){
-        if(abs(dx_sum)>abs(dy_sum)&&abs(dx_sum)>=THRESH_X){
-          if(dx_sum<0){sh(EMIT_LEFT_HOLD);hold_mode=HM_SCREEN_OFF;}
-          else         sh(EMIT_RIGHT_TAP);
-        }else if(abs(dy_sum)>=THRESH_Y){
-          if(dy_sum<0){hold_mode=HM_VOL_UP;last_repeat_ms=0;sh(EMIT_UP_TAP);}
-          else         {hold_mode=HM_VOL_DOWN;last_repeat_ms=0;sh(EMIT_DOWN_TAP);}
-        }
-      }
-      reset_window();
-    }
+    dx = dy = 0;
   }
 }
 
