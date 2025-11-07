@@ -23,7 +23,7 @@
 /* ======= TÙY CHỈNH ======= */
 #define DEV_E11_NAME       "BLE-M3 Consumer Control"
 #define DEV_E12_NAME       "BLE-M3 Mouse"           // sẽ grab & chặn
-#define E11_QUIET_MS       500                      // nhả nếu event11 im > 500 ms
+#define E11_QUIET_MS       600                      // nhả nếu event11 im > 500 ms
 #define POLL_MS            40                       // chu kỳ poll
 #define KEY_DEBOUNCE_MS    15                       // chống dội EV_KEY
 #define PTT_KEY            KEY_MEDIA                // 🔧 Phím PTT (vd: KEY_MEDIA, KEY_CAMERA, KEY_F1)
