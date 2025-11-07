@@ -1,4 +1,4 @@
-// BLE-M3.c — Trigger từ event12, giữ theo hoạt động event11 (Android 14)
+// BLE-M3.c — Trigger từ event12, giữ theo hoạt động event11, kèm LOG thời gian (Android 14)
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -19,7 +19,7 @@
 /* ===== Tham số tinh chỉnh ===== */
 #define CAMERA_BURST_ABS       0x700   // nhận diện "chụp ảnh" ở event12 (REL lớn)
 #define E11_QUIET_MS           300     // event11 im bao lâu thì nhả
-#define WAIT_E11_TIMEOUT_MS    2500    // thời gian tối đa chờ event11 sau khi có event12
+#define WAIT_E11_TIMEOUT_MS    1500    // tối đa chờ event11 sau khi có event12
 #define POLL_MS                40      // chu kỳ poll
 
 static inline long long now_ms(void){
@@ -73,9 +73,13 @@ static void ptt_up(void){ emit_ev(EV_KEY,KEY_MEDIA,0); }
 /* ===== Trạng thái FSM ===== */
 typedef enum { ST_IDLE=0, ST_AWAIT_E11, ST_HOLDING } State;
 static State st = ST_IDLE;
-static long long await_deadline = 0;     // hết hạn chờ event11
-static long long last_e11_ms = 0;        // lần cuối có hoạt động event11
 static int ptt_active = 0;
+
+/* Mốc thời gian để LOG */
+static long long e12_start_ms = 0;   // lúc event12 burst được phát hiện
+static long long first_e11_ms = 0;   // lúc nhận event11 đầu tiên sau e12
+static long long last_e11_ms  = 0;   // lần gần nhất có hoạt động event11
+static long long await_deadline = 0; // hết hạn chờ event11
 
 /* ===== Mouse (event12) — phát hiện burst để kích hoạt AWAIT_E11 ===== */
 typedef struct { int btn_down; int max_dx, max_dy; } mouse_ctx_t;
@@ -97,13 +101,12 @@ static void on_mouse_event(struct input_event *e){
       M.btn_down=0;
       int burst = (M.max_dx>=CAMERA_BURST_ABS) || (M.max_dy>=CAMERA_BURST_ABS);
       if(burst){
-        // BẮT ĐẦU QUY TRÌNH: event12 báo hiệu -> đợi event11
         st = ST_AWAIT_E11;
+        e12_start_ms = t;
+        first_e11_ms = 0;
+        last_e11_ms  = 0;
         await_deadline = t + WAIT_E11_TIMEOUT_MS;
-        // reset dấu mốc e11 để khi có e11 đầu tiên sẽ cập nhật
-        last_e11_ms = 0;
-        // không phát PTT ở đây; chỉ phát khi có event11 thật sự
-        fprintf(stderr,"[BLE-M3] event12 burst -> AWAIT_E11\n");
+        fprintf(stderr,"[BLE-M3] e12 burst -> AWAIT_E11 (t=%lld)\n", e12_start_ms);
       }
       reset_mouse();
       return;
@@ -111,27 +114,41 @@ static void on_mouse_event(struct input_event *e){
   }
 }
 
-/* ===== Consumer (event11) — dùng làm “nhịp giữ/nhả” ===== */
+/* ===== Consumer (event11) — dùng làm “nhịp giữ/nhả” + LOG gap ===== */
 static void on_consumer_event(struct input_event *e){
   long long t = now_ms();
 
   // MỌI hoạt động từ event11 đều được coi là "đang còn hoạt động"
   if (e->type==EV_KEY || e->type==EV_MSC || (e->type==EV_SYN && e->code==SYN_REPORT)){
+    // LOG: nếu đây là event11 đầu tiên sau e12
+    if (st == ST_AWAIT_E11 && first_e11_ms == 0){
+      first_e11_ms = t;
+      long long dt = first_e11_ms - e12_start_ms;
+      fprintf(stderr,"[BLE-M3] first e11 after e12: %lld ms\n", dt);
+    }
+
+    // LOG: khoảng cách giữa các event11 liên tiếp
+    if (last_e11_ms != 0){
+      long long gap = t - last_e11_ms;
+      const char *tt = (e->type==EV_KEY? "KEY" : (e->type==EV_MSC? "MSC" : "SYN"));
+      fprintf(stderr,"[BLE-M3] e11 gap: %4lld ms  (%s code=0x%03x val=%d)\n",
+              gap, tt, e->code, e->value);
+    } else {
+      fprintf(stderr,"[BLE-M3] e11 activity seen (first)\n");
+    }
     last_e11_ms = t;
+
     if (st == ST_AWAIT_E11){
-      // lần đầu thấy event11 kể từ khi AWAIT_E11 -> bắt đầu giữ
       if (!ptt_active){ ptt_down(); ptt_active=1; }
       st = ST_HOLDING;
-      fprintf(stderr,"[BLE-M3] event11 activity -> HOLDING\n");
+      fprintf(stderr,"[BLE-M3] -> HOLDING (PTT DOWN)\n");
     }
   }
-
-  // Không cần xử lý chi tiết 1/2/0 nữa; im lặng mới là tín hiệu nhả
 }
 
 /* ===== MAIN ===== */
 int main(int argc,char**argv){
-  signal(SIGINT, SIG_DFL);
+  signal(SIGINT,  SIG_DFL);
   signal(SIGTERM, SIG_DFL);
 
   if(uinput_init()!=0){ fprintf(stderr,"[BLE-M3] /dev/uinput lỗi\n"); return 1; }
@@ -149,16 +166,20 @@ int main(int argc,char**argv){
 
     // Timeout khi đang chờ event11 mà không đến
     if (st == ST_AWAIT_E11 && t >= await_deadline){
+      fprintf(stderr,"[BLE-M3] timeout AWAIT_E11 after %lld ms -> IDLE (no PTT)\n",
+              t - e12_start_ms);
       st = ST_IDLE;
-      fprintf(stderr,"[BLE-M3] timeout AWAIT_E11 -> IDLE\n");
+      e12_start_ms = first_e11_ms = last_e11_ms = 0;
     }
 
     // Khi đang HOLDING: nhả nếu event11 im quá lâu
     if (st == ST_HOLDING){
       if (last_e11_ms>0 && (t - last_e11_ms) > E11_QUIET_MS){
         if (ptt_active){ ptt_up(); ptt_active=0; }
+        fprintf(stderr,"[BLE-M3] RELEASE: e11 quiet for %lld ms -> IDLE\n",
+                t - last_e11_ms);
         st = ST_IDLE;
-        fprintf(stderr,"[BLE-M3] event11 quiet -> RELEASE & IDLE\n");
+        e12_start_ms = first_e11_ms = last_e11_ms = 0;
       }
     }
 
@@ -167,9 +188,10 @@ int main(int argc,char**argv){
     for(int i=0;i<2;i++){
       if(pfds[i].fd<0) continue;
       if(pfds[i].revents & (POLLERR|POLLHUP|POLLNVAL)){
-        // thiết bị rớt -> nhả an toàn
         if(ptt_active){ ptt_up(); ptt_active=0; }
+        fprintf(stderr,"[BLE-M3] device error/hup -> IDLE\n");
         st = ST_IDLE;
+        e12_start_ms = first_e11_ms = last_e11_ms = 0;
         continue;
       }
       if(!(pfds[i].revents & POLLIN)) continue;
@@ -182,7 +204,7 @@ int main(int argc,char**argv){
     }
   }
 
-  // Không bao giờ tới đây, nhưng để sạch sẽ:
+  // cleanup (thực tế ít khi tới đây)
   if(ptt_active){ ptt_up(); }
   if(fd_cons>=0){ ioctl(fd_cons,EVIOCGRAB,0); close(fd_cons); }
   if(fd_mouse>=0){ ioctl(fd_mouse,EVIOCGRAB,0); close(fd_mouse); }
