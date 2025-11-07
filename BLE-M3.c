@@ -19,7 +19,7 @@
 /* ===== Tham số tinh chỉnh ===== */
 #define CAMERA_BURST_ABS       0x700   // nhận diện "chụp ảnh" ở event12 (REL lớn)
 #define E11_QUIET_MS           300     // event11 im bao lâu thì nhả
-#define WAIT_E11_TIMEOUT_MS    1000    // thời gian tối đa chờ event11 sau khi có event12
+#define WAIT_E11_TIMEOUT_MS    1500    // thời gian tối đa chờ event11 sau khi có event12
 #define POLL_MS                40      // chu kỳ poll
 
 static inline long long now_ms(void){
