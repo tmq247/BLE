@@ -22,7 +22,7 @@
 #define CAMERA_BURST_ABS        0x700
 
 // Vùng an toàn nhả theo im lặng của event11
-#define BASE_QUIET_MS           600     // bạn đang dùng 600ms
+#define BASE_QUIET_MS           200     // bạn đang dùng 600ms
 #define QUIET_FACTOR            15.0    // quiet_ms = max(BASE_QUIET_MS, avg_gap*factor)
 #define EMA_ALPHA               0.30    // hệ số EMA cho avg_gap
 #define POLL_MS                 40
