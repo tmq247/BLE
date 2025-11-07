@@ -1,4 +1,5 @@
-// BLE-M3.c — PTT hold ổn định cho BLE-M3 (nhả chỉ khi KHÔNG thấy 1/2 sau 0)
+// BLE-M3.c — PTT hold chắc tay cho BLE-M3 (Android 14)
+// Logic xác nhận nhả: cần 2 lần KEY_VOLUMEDOWN==1 (hoặc 1 lần ==2) trong MUST_DOWN_MS mới coi là "vẫn giữ".
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -18,9 +19,10 @@
 
 /* ===== Tham số điều chỉnh ===== */
 #define CAMERA_BURST_ABS         0x700   // nhận diện "chụp ảnh" ở event12
-#define DEBOUNCE_MS              25
+#define DEBOUNCE_MS              20
 #define CONFIRM_UP_MS            700     // tổng thời gian chờ xác nhận nhả
-#define MUST_DOWN_MS             250     // trong khoảng này, chỉ khi thấy 1/2 mới coi là còn giữ
+#define MUST_DOWN_MS             250     // chỉ trong khoảng này mới xem xét "bằng chứng giữ thật"
+#define TWO_ON_MIN_DELTA_MS      10      // 2 lần 1 phải cách nhau >= 10ms để tránh dội
 #define INACTIVITY_RELEASE_MS    3000    // mất hoạt động event11 quá ngưỡng -> nhả
 
 static inline long long now_ms(void){
@@ -79,15 +81,20 @@ static long long last_key_debounce_ms=0;
 static long long last_event11_activity_ms=0;
 
 static long long hold_start_ms=0;
-/* Xác nhận nhả theo 2 pha */
-static long long confirm_up_deadline=0;      // t0 + CONFIRM_UP_MS
-static long long must_down_deadline=0;       // t0 + MUST_DOWN_MS
+
+/* Cửa sổ xác nhận nhả (2-pha) */
+static int confirming_up = 0;              // 0=không, 1=đang chờ
+static long long confirm_up_t0 = 0;        // thời điểm bắt đầu (khi thấy 0)
+static long long confirm_up_deadline = 0;  // t0 + CONFIRM_UP_MS
+static long long must_down_deadline = 0;   // t0 + MUST_DOWN_MS
+static int seen_on_count = 0;              // số lần thấy 1 trong MUST_DOWN_MS
+static long long first_on_ms = 0;          // thời điểm 1 đầu tiên trong cửa sổ
 
 /* ===== Consumer (event11) — GIỮ mũi tên xuống => PTT hold ===== */
 static void on_consumer_event(struct input_event *e){
   long long t=now_ms();
 
-  // ghi nhận mọi hoạt động của event11 (dùng cho watchdog mất kết nối)
+  // ghi nhận hoạt động event11 (dùng cho watchdog mất kết nối)
   if (e->type==EV_KEY || e->type==EV_MSC || (e->type==EV_SYN && e->code==SYN_REPORT))
     last_event11_activity_ms = t;
 
@@ -100,30 +107,37 @@ static void on_consumer_event(struct input_event *e){
   if(e->type==EV_KEY && e->code==KEY_VOLUMEDOWN){
     if(e->value==1){                      // DOWN
       if(!ptt_active){ ptt_down(); ptt_active=1; hold_start_ms=t; }
-      // khi đã thấy DOWN thật, huỷ mọi chờ nhả
-      confirm_up_deadline=0; must_down_deadline=0;
+      // thấy DOWN thật -> hủy mọi xác nhận nhả đang treo
+      confirming_up=0; confirm_up_deadline=0; must_down_deadline=0; seen_on_count=0;
       return;
     }
-    if(e->value==2){                      // REPEAT
-      // nếu đang chờ nhả, repeat là bằng chứng còn giữ -> huỷ nhả
-      if(confirm_up_deadline>0 && t<=confirm_up_deadline){
-        confirm_up_deadline=0; must_down_deadline=0;
+    if(e->value==2){                      // REPEAT = bằng chứng giữ thật
+      if(confirming_up && t<=must_down_deadline){
+        confirming_up=0; confirm_up_deadline=0; must_down_deadline=0; seen_on_count=0;
       }
       return;
     }
-    if(e->value==0){                      // UP
-      // Bắt đầu 2 mốc thời gian
+    if(e->value==0){                      // UP -> bắt đầu cửa sổ xác nhận nhả
+      confirming_up = 1;
+      confirm_up_t0 = t;
       confirm_up_deadline = t + CONFIRM_UP_MS;
       must_down_deadline  = t + MUST_DOWN_MS;
+      seen_on_count = 0;
+      first_on_ms = 0;
       return;
     }
   }
 
-  // Trong thời gian chờ nhả: CHỈ hủy nếu thấy lại KEY 1 hoặc 2 trước MUST_DOWN_MS
-  if(confirm_up_deadline>0 && t<=confirm_up_deadline){
-    if(e->type==EV_KEY && e->code==KEY_VOLUMEDOWN &&
-       (e->value==1 || e->value==2) && t<=must_down_deadline){
-      confirm_up_deadline=0; must_down_deadline=0;   // vẫn giữ
+  // Trong thời gian chờ nhả: CHỈ hủy nếu thấy 2 lần 1 trong MUST_DOWN_MS (hoặc có 2)
+  if(confirming_up && t<=must_down_deadline){
+    if(e->type==EV_KEY && e->code==KEY_VOLUMEDOWN && e->value==1){
+      if(seen_on_count==0){ seen_on_count=1; first_on_ms=t; }
+      else {
+        if(t - first_on_ms >= TWO_ON_MIN_DELTA_MS){
+          // đủ 2 lần 1 cách nhau tối thiểu -> coi là còn giữ
+          confirming_up=0; confirm_up_deadline=0; must_down_deadline=0; seen_on_count=0;
+        }
+      }
     }
   }
 }
@@ -167,16 +181,16 @@ int main(int argc,char**argv){
     int n=poll(pfds,2,40);
     long long t=now_ms();
 
-    // 1) Hết hạn CONFIRM_UP_MS mà KHÔNG có 1/2 trở lại -> nhả
-    if(ptt_active && confirm_up_deadline>0 && t>=confirm_up_deadline){
+    // 1) Hết hạn CONFIRM_UP_MS mà KHÔNG có bằng chứng giữ thật -> nhả
+    if(ptt_active && confirming_up && t>=confirm_up_deadline){
       ptt_up(); ptt_active=0;
-      confirm_up_deadline=0; must_down_deadline=0;
+      confirming_up=0; confirm_up_deadline=0; must_down_deadline=0; seen_on_count=0;
     }
 
     // 2) Mất hoạt động event11 quá lâu -> nhả (mất kết nối)
     if(ptt_active && (t - last_event11_activity_ms) > INACTIVITY_RELEASE_MS){
       ptt_up(); ptt_active=0;
-      confirm_up_deadline=0; must_down_deadline=0;
+      confirming_up=0; confirm_up_deadline=0; must_down_deadline=0; seen_on_count=0;
     }
 
     if(n<=0) continue;
@@ -185,7 +199,8 @@ int main(int argc,char**argv){
       if(pfds[i].fd<0) continue;
 
       if(pfds[i].revents & (POLLERR|POLLHUP|POLLNVAL)){
-        if(ptt_active){ ptt_up(); ptt_active=0; confirm_up_deadline=0; must_down_deadline=0; }
+        if(ptt_active){ ptt_up(); ptt_active=0; }
+        confirming_up=0; confirm_up_deadline=0; must_down_deadline=0; seen_on_count=0;
         continue;
       }
       if(!(pfds[i].revents & POLLIN)) continue;
