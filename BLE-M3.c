@@ -1,6 +1,6 @@
 // BLE-M3.c — event12 -> đợi event11; event11 giữ PTT; im lặng thì nhả.
-// In log: t(event12), Δt(event12->event11 đầu), và gap giữa các event11 khi giữ.
-// Android/Termux + /dev/uinput. Tested kiểu luồng đọc poll().
+// Log: t(event12), Δt(event12->event11 đầu), gap giữa các lần event11.
+// PTT phát qua KEY_MEDIA + KEY_FOCUS (không dùng phím âm lượng).
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -18,20 +18,20 @@
 #include <time.h>
 #include <unistd.h>
 
-/* ======= Tham số tinh chỉnh ======= */
+/* ===== Tham số chỉnh ===== */
 #define DEV_E12_NAME       "BLE-M3 Mouse"              // event12
 #define DEV_E11_NAME       "BLE-M3 Consumer Control"   // event11
-#define E11_QUIET_MS       600   // nhả nếu event11 im > ngưỡng này
-#define POLL_MS            40    // chu kỳ poll
-#define KEY_DEBOUNCE_MS    15    // chống dội EV_KEY
+#define E11_QUIET_MS       600     // nhả nếu event11 im > ngưỡng này
+#define POLL_MS            40      // chu kỳ poll
+#define KEY_DEBOUNCE_MS    15      // chống dội EV_KEY
 
-/* ======= Tiện ích thời gian ======= */
+/* ===== Tiện ích thời gian ===== */
 static inline long long now_ms(void){
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
   return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000;
 }
 
-/* ======= Mở & GRAB thiết bị theo tên con ======= */
+/* ===== Mở & GRAB thiết bị theo tên ===== */
 static int open_by_name(const char *substr, char *out_path, size_t out_sz){
   char path[64], name[256];
   for(int i=0;i<64;i++){
@@ -49,13 +49,16 @@ static int open_by_name(const char *substr, char *out_path, size_t out_sz){
   return -1;
 }
 
-/* ======= UINPUT: phát KEY_MEDIA làm PTT ======= */
+/* ===== UINPUT: phát KEY_MEDIA + KEY_FOCUS ===== */
 static int ufd=-1;
 static int uinput_init(void){
   ufd=open("/dev/uinput",O_WRONLY|O_NONBLOCK);
   if(ufd<0){ perror("uinput"); return -1; }
+
   ioctl(ufd,UI_SET_EVBIT,EV_KEY);
-  ioctl(ufd,UI_SET_KEYBIT,KEY_MEDIA);
+  ioctl(ufd,UI_SET_KEYBIT,KEY_MEDIA);   // HEADSETHOOK
+  ioctl(ufd,UI_SET_KEYBIT,KEY_FOCUS);   // PTT chính
+  // Nếu muốn dự phòng thêm: ioctl(ufd,UI_SET_KEYBIT,KEY_CAMERA);
 
   struct uinput_setup us={0};
   us.id.bustype=BUS_USB; us.id.vendor=0x1d6b; us.id.product=0x0104; us.id.version=1;
@@ -66,30 +69,40 @@ static int uinput_init(void){
   fprintf(stderr,"[BLE-M3] Created uinput PTT device\n");
   return 0;
 }
-static void emit_ev(int type,int code,int value){
+
+static void emit_key(int code,int val){
   struct input_event ev={0}; struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-  ev.type=type; ev.code=code; ev.value=value;
+  ev.type=EV_KEY; ev.code=code; ev.value=val;
   ev.time.tv_sec=ts.tv_sec; ev.time.tv_usec=ts.tv_nsec/1000; write(ufd,&ev,sizeof(ev));
   struct input_event syn={0}; syn.type=EV_SYN; syn.code=SYN_REPORT;
   syn.time.tv_sec=ts.tv_sec; syn.time.tv_usec=ts.tv_nsec/1000; write(ufd,&syn,sizeof(syn));
 }
-static void ptt_down(void){ emit_ev(EV_KEY,KEY_MEDIA,1); fprintf(stderr,"[BLE-M3] PTT DOWN\n"); }
-static void ptt_up(void){ emit_ev(EV_KEY,KEY_MEDIA,0); fprintf(stderr,"[BLE-M3] PTT UP\n"); }
+static void ptt_down(void){
+  emit_key(KEY_MEDIA,1);
+  emit_key(KEY_FOCUS,1);
+  // emit_key(KEY_CAMERA,1);
+  fprintf(stderr,"[BLE-M3] PTT DOWN (HEADSETHOOK + FOCUS)\n");
+}
+static void ptt_up(void){
+  emit_key(KEY_MEDIA,0);
+  emit_key(KEY_FOCUS,0);
+  // emit_key(KEY_CAMERA,0);
+  fprintf(stderr,"[BLE-M3] PTT UP (HEADSETHOOK + FOCUS)\n");
+}
 
-/* ======= FSM ======= */
+/* ===== FSM & mốc thời gian ===== */
 typedef enum { ST_IDLE=0, ST_AWAIT_E11, ST_HOLDING } State;
 static State st = ST_IDLE;
 static int ptt_active = 0;
 
-/* Mốc thời gian để log & nhả */
 static long long e12_start_ms = 0;  // t(event12 bắt đầu)
 static long long first_e11_ms = 0;  // t(event11 đầu sau e12)
 static long long last_e11_ms  = 0;  // t(event11 gần nhất)
 static long long last_key_ms  = 0;  // debounce EV_KEY
 
-/* ======= event12: bắt đầu chuỗi chờ e11 ======= */
+/* ===== event12: bắt đầu chuỗi chờ e11 ===== */
 static void on_event12(struct input_event *e){
-  // Kích hoạt khi có BTN_LEFT DOWN (tránh nhiễu từ move/rel lẻ tẻ)
+  // Dùng tín hiệu rõ ràng: BTN_LEFT DOWN để khởi phát
   if(e->type==EV_KEY && e->code==BTN_LEFT && e->value==1){
     e12_start_ms = now_ms();
     first_e11_ms = 0;
@@ -99,7 +112,7 @@ static void on_event12(struct input_event *e){
   }
 }
 
-/* ======= event11: giữ/nhả + log gap ======= */
+/* ===== event11: giữ/nhả + log gap ===== */
 static void on_event11(struct input_event *e){
   long long t = now_ms();
 
@@ -109,9 +122,9 @@ static void on_event11(struct input_event *e){
     last_key_ms = t;
   }
 
-  // Ta coi BẤT KỲ hoạt động e11 (KEY/MSC/SYN) là "vẫn đang có e11"
+  // Bất kỳ hoạt động e11 (KEY/MSC/SYN) đều tính là "còn hoạt động"
   if (e->type==EV_KEY || e->type==EV_MSC || (e->type==EV_SYN && e->code==SYN_REPORT)){
-    // Nếu đang ở AWAIT_E11 -> log Δt và vào HOLDING
+    // Nếu đang chờ e11 -> log Δt và bắt đầu giữ
     if (st == ST_AWAIT_E11 && first_e11_ms == 0){
       first_e11_ms = t;
       fprintf(stderr,"[BLE-M3] first e11 after e12: %lld ms\n", first_e11_ms - e12_start_ms);
@@ -135,7 +148,7 @@ static void on_event11(struct input_event *e){
   }
 }
 
-/* ======= MAIN ======= */
+/* ===== MAIN ===== */
 int main(int argc,char**argv){
   signal(SIGINT, SIG_DFL);
   signal(SIGTERM, SIG_DFL);
@@ -186,7 +199,7 @@ int main(int argc,char**argv){
       if(r!=sizeof(ev)) continue;
 
       if(pfds[i].fd==fd_e12) on_event12(&ev);
-      else /* fd_e11 */      on_event11(&ev);
+      else                  on_event11(&ev);
     }
   }
 
