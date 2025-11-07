@@ -15,24 +15,24 @@
 #include <unistd.h>
 
 /*** MÃ CỐ ĐỊNH → F1..F12 (Android keycodes 131..142) ***/
-#define EMIT_UP_TAP         "input keyevent 131"   // F1
-#define EMIT_UP_HOLD        "input keyevent 132"   // F2
-#define EMIT_DOWN_TAP       "input keyevent 133"   // F3
-#define EMIT_DOWN_HOLD      "input keyevent 134"   // F4
-#define EMIT_LEFT_TAP       "input keyevent 135"   // F5
-#define EMIT_LEFT_HOLD      "input keyevent 136"   // F6
-#define EMIT_RIGHT_TAP      "input keyevent 137"   // F7
-#define EMIT_RIGHT_HOLD     "input keyevent 138"   // F8
-#define EMIT_CENTER_TAP     "input keyevent 139"   // F9
-#define EMIT_CENTER_HOLD    "input keyevent 140"   // F10
-#define EMIT_CAMERA_TAP     "input keyevent 141"   // F11
-#define EMIT_CAMERA_HOLD    "input keyevent 142"   // F12
+#define EMIT_UP_TAP         "input keyevent 79"   // F1
+#define EMIT_UP_HOLD        "input keyevent 79"   // F2
+#define EMIT_DOWN_TAP       "input keyevent 79"   // F3
+#define EMIT_DOWN_HOLD      "input keyevent 79"   // F4
+#define EMIT_LEFT_TAP       "input keyevent 79"   // F5
+#define EMIT_LEFT_HOLD      "input keyevent 79"   // F6
+#define EMIT_RIGHT_TAP      "input keyevent 79"   // F7
+#define EMIT_RIGHT_HOLD     "input keyevent 79"   // F8
+#define EMIT_CENTER_TAP     "input keyevent 79"   // F9
+#define EMIT_CENTER_HOLD    "input keyevent 79"   // F10
+#define EMIT_CAMERA_TAP     "input keyevent 79"   // F11
+#define EMIT_CAMERA_HOLD    "input keyevent 79"   // F12
 
 /*** THỜI GIAN & NGƯỠNG ***/
 #define HOLD_MS    350
 #define WINDOW_MS  100
-#define THRESH_X   2
-#define THRESH_Y   2
+#define THRESH_X   4
+#define THRESH_Y   4
 #define IDLE_MS    200
 #define REPEAT_MS  120
 
