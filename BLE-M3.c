@@ -1,6 +1,6 @@
 // BLE-M3.c — event12 -> đợi event11; event11 giữ PTT; im lặng thì nhả.
 // Log: t(event12), Δt(event12->event11 đầu), gap giữa các lần event11.
-// PTT phát qua KEY_MEDIA + KEY_FOCUS (không dùng phím âm lượng).
+// PTT phát qua KEY_MEDIA + KEY_CAMERA (không dùng phím âm lượng / KEY_FOCUS).
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -49,16 +49,15 @@ static int open_by_name(const char *substr, char *out_path, size_t out_sz){
   return -1;
 }
 
-/* ===== UINPUT: phát KEY_MEDIA + KEY_FOCUS ===== */
+/* ===== UINPUT: phát KEY_MEDIA + KEY_CAMERA ===== */
 static int ufd=-1;
 static int uinput_init(void){
   ufd=open("/dev/uinput",O_WRONLY|O_NONBLOCK);
   if(ufd<0){ perror("uinput"); return -1; }
 
   ioctl(ufd,UI_SET_EVBIT,EV_KEY);
-  ioctl(ufd,UI_SET_KEYBIT,KEY_MEDIA);   // HEADSETHOOK
-  ioctl(ufd,UI_SET_KEYBIT,KEY_FOCUS);   // PTT chính
-  // Nếu muốn dự phòng thêm: ioctl(ufd,UI_SET_KEYBIT,KEY_CAMERA);
+  ioctl(ufd,UI_SET_KEYBIT,KEY_MEDIA);   // HEADSETHOOK (79)
+  ioctl(ufd,UI_SET_KEYBIT,KEY_CAMERA);  // CAMERA (212)
 
   struct uinput_setup us={0};
   us.id.bustype=BUS_USB; us.id.vendor=0x1d6b; us.id.product=0x0104; us.id.version=1;
@@ -79,15 +78,13 @@ static void emit_key(int code,int val){
 }
 static void ptt_down(void){
   emit_key(KEY_MEDIA,1);
-  emit_key(KEY_FOCUS,1);
-  // emit_key(KEY_CAMERA,1);
-  fprintf(stderr,"[BLE-M3] PTT DOWN (HEADSETHOOK + FOCUS)\n");
+  emit_key(KEY_CAMERA,1);
+  fprintf(stderr,"[BLE-M3] PTT DOWN (MEDIA + CAMERA)\n");
 }
 static void ptt_up(void){
   emit_key(KEY_MEDIA,0);
-  emit_key(KEY_FOCUS,0);
-  // emit_key(KEY_CAMERA,0);
-  fprintf(stderr,"[BLE-M3] PTT UP (HEADSETHOOK + FOCUS)\n");
+  emit_key(KEY_CAMERA,0);
+  fprintf(stderr,"[BLE-M3] PTT UP (MEDIA + CAMERA)\n");
 }
 
 /* ===== FSM & mốc thời gian ===== */
