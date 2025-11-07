@@ -20,7 +20,7 @@
 #define COALESCE_MS         90
 #define RELEASE_DELAY_MS    120     // nhả trễ để chống dội 0→1→0
 #define DEBOUNCE_MS         30
-#define STALE_RELEASE_MS    180     // nếu không còn repeat > ngưỡng này -> tự nhả
+#define STALE_RELEASE_MS    160     // nếu không còn repeat > ngưỡng này -> tự nhả
 #define POLL_TIMEOUT_MS     40
 
 static inline void sh(const char *cmd){ system(cmd); }
