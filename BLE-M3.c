@@ -38,7 +38,7 @@
 
 static inline void sh(const char *cmd){ system(cmd); }
 static long long now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-  return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000; }
+  return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000; }
 
 /* ==== Tìm và GRAB thiết bị ==== */
 static int open_by_name(const char *substr) {
