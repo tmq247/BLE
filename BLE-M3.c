@@ -1,12 +1,12 @@
-// BLE-M3.c — Map GIỮ mũi tên xuống -> PTT hold (Android 14)
+// BLE-M3.c — PTT hold mũi tên xuống, phát HEADSETHOOK bằng uinput (Android 14)
 
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/input.h>
+#include <linux/uinput.h>
 #include <poll.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,31 +15,17 @@
 #include <time.h>
 #include <unistd.h>
 
-/*================== CẤU HÌNH PHÁT PTT ==================*/
-// Zello thường map tốt với KEYCODE_HEADSETHOOK (79)
-#define EMIT_PTT_TAP   "input keyevent 79"
-// Nếu bạn có tool phát key down/up thật (uinput) thì thay 2 dòng dưới.
-// Với 'input keyevent' Android không tách được down/up nhưng Zello vẫn nhận tốt
-// nếu ta gọi DOWN ở nhấn và UP ở nhả (vẫn dùng cùng lệnh để đơn giản).
-#define EMIT_PTT_DOWN  "input keyevent 79"
-#define EMIT_PTT_UP    "input keyevent 79"
-
-// Bật chế độ giữ-để-nói
-#define HOLD_TO_TALK 1
-
-/*================== THAM SỐ NHẬN DIỆN ==================*/
-#define CLICK_MAX_MS       350
+/* ===== Tham số ===== */
 #define CAMERA_BURST_ABS   0x700
-#define DEBOUNCE_MS        80
 #define COALESCE_MS        90
+#define RELEASE_DELAY_MS   120     // trì hoãn nhả để chống dội
+#define DEBOUNCE_MS        40
 
 static inline void sh(const char *cmd){ system(cmd); }
-static long long now_ms(void){
-  struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-  return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000;
-}
+static long long now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+  return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000; }
 
-/*================== MỞ & GRAB THIẾT BỊ ==================*/
+/* ===== Mở & GRAB thiết bị thật ===== */
 static int open_by_name(const char *substr) {
   char path[64], name[256];
   for (int i=0;i<64;i++){
@@ -56,60 +42,91 @@ static int open_by_name(const char *substr) {
   return -1;
 }
 
+/* ===== UINPUT: tạo bàn phím ảo phát KEY_MEDIA (-> HEADSETHOOK) ===== */
+static int ufd = -1;
+
+static int uinput_init(void){
+  ufd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+  if (ufd < 0){ perror("open /dev/uinput"); return -1; }
+
+  if (ioctl(ufd, UI_SET_EVBIT, EV_KEY) < 0) return -1;
+  if (ioctl(ufd, UI_SET_KEYBIT, KEY_MEDIA) < 0) return -1; // 226
+
+  struct uinput_setup us = {0};
+  us.id.bustype = BUS_USB;
+  us.id.vendor  = 0x1d6b;  // dummy
+  us.id.product = 0x0104;  // dummy
+  us.id.version = 1;
+  snprintf(us.name, sizeof(us.name), "ble-m3-ptt");
+
+  if (ioctl(ufd, UI_DEV_SETUP, &us) < 0) return -1;
+  if (ioctl(ufd, UI_DEV_CREATE) < 0) return -1;
+
+  // nhỏ delay cho thiết bị sẵn sàng
+  usleep(100*1000);
+  fprintf(stderr,"[BLE-M3] Created uinput device for PTT\n");
+  return 0;
+}
+
+static void uinput_emit(int type, int code, int value){
+  struct input_event ev = {0};
+  ev.type = type; ev.code = code; ev.value = value;
+  clock_gettime(CLOCK_MONOTONIC, &ev.time);
+  write(ufd, &ev, sizeof(ev));
+
+  struct input_event syn = {0};
+  syn.type = EV_SYN; syn.code = SYN_REPORT; syn.value = 0;
+  clock_gettime(CLOCK_MONOTONIC, &syn.time);
+  write(ufd, &syn, sizeof(syn));
+}
+
+static void ptt_down(void){ uinput_emit(EV_KEY, KEY_MEDIA, 1); }
+static void ptt_up(void)  { uinput_emit(EV_KEY, KEY_MEDIA, 0); }
+static void ptt_tap(void) { uinput_emit(EV_KEY, KEY_MEDIA, 1); uinput_emit(EV_KEY, KEY_MEDIA, 0); }
+
+/* ===== Trạng thái PTT & debounce ===== */
 static volatile int running=1;
 static void stop(int s){(void)s;running=0;}
 
-/*================== CONSUMER (event11) ==================*
- * Map GIỮ mũi tên xuống (KEY_VOLUMEDOWN) -> PTT hold.
- * Bỏ qua value=2 (autorepeat). Không đụng tới VOLUMEUP.
- */
-static long long last_consumer_ms=0;
 static int ptt_active = 0;
+static long long last_vol_evt_ms = 0;
+static long long pending_release_deadline = 0;
 
+/* ===== Consumer (event11): GIỮ mũi tên xuống -> PTT hold ===== */
 static void on_consumer_event(struct input_event *e){
   if (e->type != EV_KEY) return;
 
-  // Chỉ xử lý KEY_VOLUMEDOWN (0x72)
+  long long t = now_ms();
+  if (t - last_vol_evt_ms < DEBOUNCE_MS) return; // chống rung nhanh
+  last_vol_evt_ms = t;
+
   if (e->code == KEY_VOLUMEDOWN){
-    if (e->value == 1) {            // nhấn
-      if (!ptt_active){
-        sh(EMIT_PTT_DOWN);
-        ptt_active = 1;
-      }
+    if (e->value == 1){           // nhấn
+      pending_release_deadline = 0; // hủy nhả trễ nếu có
+      if (!ptt_active){ ptt_down(); ptt_active = 1; }
       return;
     }
-    if (e->value == 0) {            // nhả
-      if (ptt_active){
-        sh(EMIT_PTT_UP);
-        ptt_active = 0;
-      }
+    if (e->value == 0){           // nhả
+      // nhả trễ để tránh dội 0→1→0 rất nhanh
+      pending_release_deadline = t + RELEASE_DELAY_MS;
       return;
     }
-    if (e->value == 2) {            // autorepeat -> bỏ qua
-      return;
-    }
+    // value==2 (autorepeat) -> bỏ qua
   }
-  // Các phím consumer khác: bỏ qua để không ảnh hưởng âm lượng, v.v.
 }
 
-/*================== MOUSE (event12) ==================*
- * Nhận diện “chụp ảnh” bằng burst REL rất lớn -> PTT tap (tùy chọn).
- */
+/* ===== Mouse (event12): “chụp ảnh” -> PTT tap, NHƯNG KHÔNG khi đang hold ===== */
 typedef struct {
   int btn_down;
   long long t_down;
-  int rel_seen;
-  int max_abs_dx;
-  int max_abs_dy;
+  int max_abs_dx, max_abs_dy;
   long long last_emit;
 } mouse_ctx_t;
 
 static mouse_ctx_t M = {0};
 
-static void reset_mouse_window(long long t){
-  M.rel_seen = 0;
-  M.max_abs_dx = 0;
-  M.max_abs_dy = 0;
+static void reset_mouse(long long t){
+  M.max_abs_dx = M.max_abs_dy = 0;
   M.last_emit = t;
 }
 
@@ -117,53 +134,46 @@ static void on_mouse_event(struct input_event *e){
   long long t = now_ms();
 
   if (e->type == EV_REL){
-    if (e->code == REL_X){
-      int v = e->value; if (v<0) v = -v;
-      if (v > M.max_abs_dx) M.max_abs_dx = v;
-      M.rel_seen = 1;
-    } else if (e->code == REL_Y){
-      int v = e->value; if (v<0) v = -v;
-      if (v > M.max_abs_dy) M.max_abs_dy = v;
-      M.rel_seen = 1;
-    }
+    int v = e->value; if (v<0) v = -v;
+    if (e->code == REL_X){ if (v > M.max_abs_dx) M.max_abs_dx = v; }
+    else if (e->code == REL_Y){ if (v > M.max_abs_dy) M.max_abs_dy = v; }
     return;
   }
 
   if (e->type == EV_KEY && e->code == BTN_LEFT){
     if (e->value == 1){
-      M.btn_down = 1;
-      M.t_down = t;
-      reset_mouse_window(t);
+      M.btn_down = 1; M.t_down = t; reset_mouse(t);
       return;
     } else if (e->value == 0 && M.btn_down){
       M.btn_down = 0;
-
-      // Có burst lớn (|REL| >= 0x700) -> coi là nút "chụp ảnh" đặc trưng BLE-M3
       int burst = (M.max_abs_dx >= CAMERA_BURST_ABS) || (M.max_abs_dy >= CAMERA_BURST_ABS);
-      if (burst){
-        // Nếu vẫn muốn dùng click "chụp ảnh" để PTT tap, giữ lại dòng dưới:
-        sh(EMIT_PTT_TAP);
+      if (burst && !ptt_active){
+        // chỉ tap khi KHÔNG đang giữ PTT
+        ptt_tap();
       }
-      reset_mouse_window(t);
+      reset_mouse(t);
       return;
     }
   }
 
   if (e->type == EV_SYN && e->code == SYN_REPORT){
-    if (t - M.last_emit > COALESCE_MS){
-      M.last_emit = t;
-    }
+    if (t - M.last_emit > COALESCE_MS) M.last_emit = t;
   }
 }
 
-/*================== MAIN ==================*/
+/* ===== MAIN ===== */
 int main(int argc,char**argv){
   signal(SIGINT,stop); signal(SIGTERM,stop);
+
+  if (uinput_init() != 0){
+    fprintf(stderr,"[BLE-M3] Không tạo được uinput. Cần root & /dev/uinput.\n");
+    return 1;
+  }
 
   int fd_cons  = open_by_name("BLE-M3 Consumer Control");
   int fd_mouse = open_by_name("BLE-M3 Mouse");
   if (fd_cons<0 && fd_mouse<0){
-    fprintf(stderr,"[BLE-M3] Không tìm thấy thiết bị BLE-M3.\n");
+    fprintf(stderr,"[BLE-M3] Không tìm thấy BLE-M3.\n");
     return 1;
   }
 
@@ -174,7 +184,15 @@ int main(int argc,char**argv){
 
   struct input_event ev;
   while (running){
-    int n = poll(pfds, 2, 300);
+    // timeout ngắn để xử lý nhả trễ
+    int n = poll(pfds, 2, 50);
+    long long t = now_ms();
+
+    // xử lý nhả trễ
+    if (ptt_active && pending_release_deadline>0 && t >= pending_release_deadline){
+      ptt_up(); ptt_active = 0; pending_release_deadline = 0;
+    }
+
     if (n <= 0) continue;
 
     for (int i=0;i<2;i++){
@@ -183,15 +201,17 @@ int main(int argc,char**argv){
       ssize_t r = read(pfds[i].fd, &ev, sizeof(ev));
       if (r != sizeof(ev)) continue;
 
-      if (pfds[i].fd == fd_cons){
-        on_consumer_event(&ev);
-      } else if (pfds[i].fd == fd_mouse){
-        on_mouse_event(&ev);
-      }
+      if (pfds[i].fd == fd_cons)  on_consumer_event(&ev);
+      else if (pfds[i].fd == fd_mouse) on_mouse_event(&ev);
     }
   }
 
   if (fd_cons  >= 0){ ioctl(fd_cons , EVIOCGRAB, 0); close(fd_cons ); }
   if (fd_mouse >= 0){ ioctl(fd_mouse, EVIOCGRAB, 0); close(fd_mouse); }
+
+  if (ufd >= 0){
+    ioctl(ufd, UI_DEV_DESTROY);
+    close(ufd);
+  }
   return 0;
 }
