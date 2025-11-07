@@ -1,4 +1,4 @@
-// BLE-M3.c — PTT hold bằng mũi tên xuống, chỉ nhả khi thấy value=0 (Android 14)
+// BLE-M3.c — PTT hold chắc chắn cho BLE-M3 (cancel theo mọi hoạt động event11, kể cả EV_MSC)
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -17,11 +17,11 @@
 #include <unistd.h>
 
 /* ===== Tham số ===== */
-#define CAMERA_BURST_ABS        0x700  // nhận diện "chụp ảnh" ở event12
-#define COALESCE_MS             90
-#define DEBOUNCE_MS             25
-#define CONFIRM_UP_MS           300    // thời gian "xác nhận nhả": nếu 1/2 xuất hiện -> hủy nhả
-#define EMERGENCY_RELEASE_MS    6000   // mất kết nối thật sự mới tự nhả
+#define CAMERA_BURST_ABS         0x700   // nhận diện "chụp ảnh" ở event12
+#define COALESCE_MS              90
+#define DEBOUNCE_MS              25
+#define CONFIRM_UP_MS            700     // đang chờ nhả: chỉ cần có hoạt động event11 (MSC/KEY) sẽ hủy nhả
+#define INACTIVITY_RELEASE_MS    3000    // nếu hoàn toàn KHÔNG có hoạt động event11 quá thời gian này -> nhả (mất kết nối)
 
 static inline long long now_ms(void){
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
@@ -75,34 +75,49 @@ static void ptt_tap(void){ ptt_down(); ptt_up(); }
 /* ===== Trạng thái ===== */
 static volatile int running=1; static void stop(int s){(void)s;running=0;}
 static int ptt_active=0;
-static long long last_evt_ms=0;              // chống nhiễu
+static long long last_debounce_ms=0;
+
 static long long hold_start_ms=0;
-static long long confirm_up_deadline=0;      // >0 nghĩa là đang chờ xác nhận nhả
+static long long confirm_up_deadline=0;      // >0: đang chờ nhả
+static long long last_consumer_activity_ms=0; // mọi hoạt động từ event11 (MSC/KEY/SYN)
 
-/* ===== Consumer (event11) — GIỮ mũi tên xuống => PTT hold ===== */
+/* ===== Consumer (event11) — GIỮ mũi tên xuống => PTT hold
+ *  - Hủy confirm-up nếu có BẤT KỲ hoạt động nào từ event11 (MSC/KEY)
+ *  - Chỉ lên/xuống PTT theo 1/0; không dùng repeat để quyết định
+ */
 static void on_consumer_event(struct input_event *e){
-  if(e->type!=EV_KEY) return;
   long long t=now_ms();
-  if(t-last_evt_ms<DEBOUNCE_MS) return;  // lọc rung rất nhanh
-  last_evt_ms=t;
 
-  if(e->code==KEY_VOLUMEDOWN){
-    if(e->value==1){                      // DOWN
-      // nếu đang đếm xác nhận nhả mà người dùng vẫn giữ/tiếp tục repeat -> hủy nhả
-      confirm_up_deadline=0;
-      if(!ptt_active){ ptt_down(); ptt_active=1; hold_start_ms=t; }
-      return;
+  // Ghi nhận MỌI hoạt động (kể cả EV_MSC, EV_SYN) để chống "nhả khi vẫn giữ"
+  last_consumer_activity_ms = t;
+
+  // Chống rung rất nhanh (áp cho EV_KEY)
+  if(e->type==EV_KEY){
+    if(t-last_debounce_ms<DEBOUNCE_MS) return;
+    last_debounce_ms=t;
+  }
+
+  // Bất kỳ hoạt động nào trong lúc đang chờ nhả -> hủy nhả
+  if(confirm_up_deadline>0){
+    // nếu là KEY 1/2 hoặc MSC/SYN đều coi là còn giữ
+    if (e->type==EV_KEY || e->type==EV_MSC || (e->type==EV_SYN && e->code==SYN_REPORT)){
+      confirm_up_deadline=0; // vẫn giữ
     }
-    if(e->value==2){                      // REPEAT
-      // chỉ dùng để hủy pending release nếu có
-      if(confirm_up_deadline>0) confirm_up_deadline=0;
+  }
+
+  if(e->type==EV_KEY && e->code==KEY_VOLUMEDOWN){
+    if(e->value==1){                      // DOWN
+      if(!ptt_active){ ptt_down(); ptt_active=1; hold_start_ms=t; }
+      // nếu có pending nhả thì hủy
+      confirm_up_deadline=0;
       return;
     }
     if(e->value==0){                      // UP
-      // không nhả ngay -> chờ xác nhận trong CONFIRM_UP_MS
+      // Không nhả ngay -> chờ xác nhận; nếu trong thời gian đó còn hoạt động -> hủy nhả
       confirm_up_deadline=t+CONFIRM_UP_MS;
       return;
     }
+    // value==2 (repeat) không dùng để quyết định, chỉ đã xử lý ở "hoạt động" phía trên
   }
 }
 
@@ -140,24 +155,31 @@ int main(int argc,char**argv){
   struct pollfd pfds[2]={{fd_cons,POLLIN,0},{fd_mouse,POLLIN,0}};
   struct input_event ev;
 
+  // ghi mốc ban đầu cho watchdog "mất hoạt động"
+  last_consumer_activity_ms = now_ms();
+
   while(running){
     int n=poll(pfds,2,40);
     long long t=now_ms();
 
-    // 1) Xác nhận nhả: chỉ nhả khi hết CONFIRM_UP_MS mà KHÔNG có down/repeat nào chen vào
+    // 1) Nếu đang chờ nhả và đã hết hạn mà KHÔNG có hoạt động mới -> nhả
     if(ptt_active && confirm_up_deadline>0 && t>=confirm_up_deadline){
+      // Nếu vẫn có hoạt động mới trong khoảng chờ, confirm_up_deadline đã bị hủy ở on_consumer_event()
       ptt_up(); ptt_active=0; confirm_up_deadline=0;
     }
-    // 2) Emergency: nếu giữ quá lâu mà không có sự kiện nào (mất kết nối) -> nhả
-    if(ptt_active && (t-hold_start_ms)>EMERGENCY_RELEASE_MS && confirm_up_deadline==0){
-      ptt_up(); ptt_active=0;
+
+    // 2) Nếu hoàn toàn KHÔNG có hoạt động event11 trong thời gian dài -> nhả (mất kết nối)
+    if(ptt_active && (t - last_consumer_activity_ms) > INACTIVITY_RELEASE_MS){
+      ptt_up(); ptt_active=0; confirm_up_deadline=0;
     }
 
     if(n<=0) continue;
 
     for(int i=0;i<2;i++){
       if(pfds[i].fd<0) continue;
+
       if(pfds[i].revents & (POLLERR|POLLHUP|POLLNVAL)){
+        // Thiết bị rớt -> nhả an toàn
         if(ptt_active){ ptt_up(); ptt_active=0; confirm_up_deadline=0; }
         continue;
       }
