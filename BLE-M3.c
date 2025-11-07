@@ -21,7 +21,7 @@
 #define CAMERA_BURST_ABS         0x700   // nhận diện "chụp ảnh" ở event12
 #define DEBOUNCE_MS              20
 #define CONFIRM_UP_MS            700     // tổng thời gian chờ xác nhận nhả
-#define MUST_DOWN_MS             250     // chỉ trong khoảng này mới xem xét "bằng chứng giữ thật"
+#define MUST_DOWN_MS             200     // chỉ trong khoảng này mới xem xét "bằng chứng giữ thật"
 #define TWO_ON_MIN_DELTA_MS      10      // 2 lần 1 phải cách nhau >= 10ms để tránh dội
 #define INACTIVITY_RELEASE_MS    3000    // mất hoạt động event11 quá ngưỡng -> nhả
 
