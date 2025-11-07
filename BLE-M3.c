@@ -1,5 +1,6 @@
 // BLE-M3.c — PTT hold chắc tay cho BLE-M3 (Android 14)
-// Nhả chỉ khi KHÔNG có "giữ thật": cần 2 lần 1 LIỀN NHAU (không có 0 xen giữa) trong MUST_DOWN_MS để hủy nhả.
+// Fix: KHÔNG huỷ xác nhận nhả chỉ vì thấy '1' đơn lẻ trong cửa sổ confirm.
+// Chỉ huỷ khi có 2 lần '1' LIỀN NHAU (không xen '0') trong MUST_DOWN_MS hoặc có '2' (repeat).
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -22,9 +23,9 @@
 #define DEBOUNCE_MS              20
 #define CONFIRM_UP_MS            900    // tổng thời gian chờ nhả
 #define MUST_DOWN_MS             220    // chỉ xét "bằng chứng giữ" trong khoảng này
-#define TWO_ON_MIN_DELTA_MS      15     // 2 lần 1 phải cách nhau tối thiểu 15ms
-#define INACTIVITY_RELEASE_MS    3000   // mất hoạt động event11 quá ngưỡng -> nhả
-#define SAFETY_MAX_HOLD_MS       90000  // tối đa 90s để tránh kẹt vĩnh viễn
+#define TWO_ON_MIN_DELTA_MS      15     // 2 lần '1' cách nhau tối thiểu
+#define INACTIVITY_RELEASE_MS    3000   // mất hoạt động event11 -> nhả
+#define SAFETY_MAX_HOLD_MS       90000  // trần an toàn
 
 static inline long long now_ms(void){
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
@@ -48,7 +49,7 @@ static int open_by_name(const char *substr){
   return -1;
 }
 
-/* ===== UINPUT: tạo phím ảo phát KEY_MEDIA (HEADSETHOOK) ===== */
+/* ===== UINPUT: tạo KEY_MEDIA (HEADSETHOOK) ===== */
 static int ufd=-1;
 static int uinput_init(void){
   ufd=open("/dev/uinput",O_WRONLY|O_NONBLOCK);
@@ -83,19 +84,19 @@ static long long last_event11_activity_ms=0;
 
 static long long hold_start_ms=0;
 
-/* Xác nhận nhả (FSM) */
+/* FSM xác nhận nhả */
 static int confirming_up = 0;                // 0=không, 1=đang chờ
 static long long confirm_up_t0 = 0;
 static long long confirm_up_deadline = 0;    // t0 + CONFIRM_UP_MS
 static long long must_down_deadline = 0;     // t0 + MUST_DOWN_MS
-static int consecutive_on = 0;               // số 1 liên tiếp (reset nếu thấy 0)
+static int consecutive_on = 0;               // số '1' liên tiếp (reset nếu thấy '0')
 static long long last_on_ms = 0;
 
-/* ===== Consumer (event11) — GIỮ mũi tên xuống => PTT hold ===== */
+/* ===== Consumer (event11) ===== */
 static void on_consumer_event(struct input_event *e){
   long long t=now_ms();
 
-  // ghi nhận hoạt động event11 cho watchdog mất kết nối
+  // ghi nhận hoạt động event11 để watchdog mất kết nối
   if (e->type==EV_KEY || e->type==EV_MSC || (e->type==EV_SYN && e->code==SYN_REPORT))
     last_event11_activity_ms = t;
 
@@ -106,15 +107,17 @@ static void on_consumer_event(struct input_event *e){
   }
 
   if(e->type==EV_KEY && e->code==KEY_VOLUMEDOWN){
-    if(e->value==1){                      // DOWN
+    if(e->value==1){
       if(!ptt_active){ ptt_down(); ptt_active=1; hold_start_ms=t; }
-      // DOWN thật -> hủy mọi xác nhận nhả
-      confirming_up=0; confirm_up_deadline=0; must_down_deadline=0;
-      consecutive_on=0; last_on_ms=0;
+      // 🔴 FIX: nếu đang xác nhận nhả thì KHÔNG hủy ngay.
+      if(!confirming_up){
+        // chỉ khi không ở chế độ confirm mới hủy cờ
+        consecutive_on=0; last_on_ms=0;
+      }
       return;
     }
-    if(e->value==0){                      // UP
-      // Mở cửa sổ xác nhận; reset bộ đếm "1 liên tiếp"
+    if(e->value==0){
+      // bắt đầu confirm up
       confirming_up = 1;
       confirm_up_t0 = t;
       confirm_up_deadline = t + CONFIRM_UP_MS;
@@ -124,8 +127,8 @@ static void on_consumer_event(struct input_event *e){
       return;
     }
     if(e->value==2){
-      // Nếu có repeat (hiếm) và còn trong MUST_DOWN_MS -> coi là giữ thật => hủy nhả
       if(confirming_up && t<=must_down_deadline){
+        // repeat trong cửa sổ MUST -> coi là giữ thật -> hủy confirm
         confirming_up=0; confirm_up_deadline=0; must_down_deadline=0;
         consecutive_on=0; last_on_ms=0;
       }
@@ -133,29 +136,28 @@ static void on_consumer_event(struct input_event *e){
     }
   }
 
-  // Trong cửa sổ MUST_DOWN_MS: cần 2 lần 1 LIỀN NHAU (không xen 0) để hủy nhả
+  // Khi ĐANG confirm: cần 2 lần '1' LIỀN NHAU trong MUST_DOWN_MS để hủy
   if(confirming_up && t<=must_down_deadline){
     if(e->type==EV_KEY && e->code==KEY_VOLUMEDOWN){
       if(e->value==1){
         if(consecutive_on==0){ consecutive_on=1; last_on_ms=t; }
         else {
           if(t - last_on_ms >= TWO_ON_MIN_DELTA_MS){
-            // Đủ 2 lần 1 liền nhau -> coi là vẫn giữ
+            // đủ 2 lần '1' liên tiếp -> coi là vẫn giữ -> hủy confirm
             confirming_up=0; confirm_up_deadline=0; must_down_deadline=0;
             consecutive_on=0; last_on_ms=0;
-          } else {
-            // quá sát -> coi là dội, không tăng
           }
+          // nếu quá sát, bỏ qua như dội
         }
       } else if(e->value==0){
-        // có 0 chen vào -> reset chuỗi 1 liên tiếp
+        // thấy '0' -> reset chuỗi '1' liên tiếp
         consecutive_on=0; last_on_ms=0;
       }
     }
   }
 }
 
-/* ===== Mouse (event12) — “chụp ảnh” => PTT tap (khi không hold) ===== */
+/* ===== Mouse (event12) — burst "chụp ảnh" -> PTT tap khi không hold ===== */
 typedef struct {int btn_down; int max_dx, max_dy;} mouse_ctx_t;
 static mouse_ctx_t M={0};
 static void reset_mouse(void){ M.btn_down=0; M.max_dx=0; M.max_dy=0; }
@@ -194,21 +196,21 @@ int main(int argc,char**argv){
     int n=poll(pfds,2,40);
     long long t=now_ms();
 
-    // 1) Hết hạn CONFIRM_UP_MS mà KHÔNG có bằng chứng giữ thật -> nhả
+    // Hết hạn CONFIRM_UP_MS mà không có "giữ thật" -> nhả
     if(ptt_active && confirming_up && t>=confirm_up_deadline){
       ptt_up(); ptt_active=0;
       confirming_up=0; confirm_up_deadline=0; must_down_deadline=0;
       consecutive_on=0; last_on_ms=0;
     }
 
-    // 2) Mất hoạt động event11 quá lâu -> nhả (mất kết nối)
+    // Mất hoạt động event11 quá lâu -> nhả
     if(ptt_active && (t - last_event11_activity_ms) > INACTIVITY_RELEASE_MS){
       ptt_up(); ptt_active=0;
       confirming_up=0; confirm_up_deadline=0; must_down_deadline=0;
       consecutive_on=0; last_on_ms=0;
     }
 
-    // 3) Trần an toàn: giữ quá lâu -> nhả
+    // Trần an toàn
     if(ptt_active && (t - hold_start_ms) > SAFETY_MAX_HOLD_MS){
       ptt_up(); ptt_active=0;
       confirming_up=0; confirm_up_deadline=0; must_down_deadline=0;
