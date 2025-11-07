@@ -107,7 +107,7 @@ static void on_mouse_event(struct input_event *e){
     } else if (e->value == 0 && btn_down) {
       btn_down = 0;
       long long dt = t - press_t0;
-      if (dt >= 500) sh(EMIT_CAMERA_HOLD); // Giữ lâu → mở camera
+      if (dt >= 1000) sh(EMIT_CAMERA_HOLD); // Giữ lâu → mở camera
       else sh(EMIT_CAMERA_TAP);            // Nhấn ngắn → chụp ảnh
     }
     dx = dy = 0;
