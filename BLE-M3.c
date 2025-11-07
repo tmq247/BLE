@@ -15,30 +15,30 @@
 #include <unistd.h>
 
 /*** MÃ CỐ ĐỊNH → F1..F12 (Android keycodes 131..142) ***/
-#define EMIT_UP_TAP         "input keyevent 79"   // F1
-#define EMIT_UP_HOLD        "input keyevent 79"   // F2
-#define EMIT_DOWN_TAP       "input keyevent 79"   // F3
-#define EMIT_DOWN_HOLD      "input keyevent 79"   // F4
-#define EMIT_LEFT_TAP       "input keyevent 79"   // F5
-#define EMIT_LEFT_HOLD      "input keyevent 79"   // F6
-#define EMIT_RIGHT_TAP      "input keyevent 79"   // F7
-#define EMIT_RIGHT_HOLD     "input keyevent 79"   // F8
-#define EMIT_CENTER_TAP     "input keyevent 79"   // F9
-#define EMIT_CENTER_HOLD    "input keyevent 79"   // F10
-#define EMIT_CAMERA_TAP     "input keyevent 79"   // F11
-#define EMIT_CAMERA_HOLD    "input keyevent 79"   // F12
+#define EMIT_UP_TAP         "input keyevent 85"   // F1
+#define EMIT_UP_HOLD        "input keyevent 85"   // F2
+#define EMIT_DOWN_TAP       "input keyevent 85"   // F3
+#define EMIT_DOWN_HOLD      "input keyevent 85"   // F4
+#define EMIT_LEFT_TAP       "input keyevent 85"   // F5
+#define EMIT_LEFT_HOLD      "input keyevent 85"   // F6
+#define EMIT_RIGHT_TAP      "input keyevent 85"   // F7
+#define EMIT_RIGHT_HOLD     "input keyevent 85"   // F8
+#define EMIT_CENTER_TAP     "input keyevent 85"   // F9
+#define EMIT_CENTER_HOLD    "input keyevent 85"   // F10
+#define EMIT_CAMERA_TAP     "input keyevent 85"   // F11
+#define EMIT_CAMERA_HOLD    "input keyevent 85"   // F12
 
 /*** THỜI GIAN & NGƯỠNG ***/
 #define HOLD_MS    350
 #define WINDOW_MS  100
-#define THRESH_X   4
-#define THRESH_Y   4
+#define THRESH_X   2
+#define THRESH_Y   2
 #define IDLE_MS    200
 #define REPEAT_MS  120
 
 static inline void sh(const char *cmd){ system(cmd); }
 static long long now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-  return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000; }
+  return (long long)ts.tv_sec*2000 + ts.tv_nsec/1000000; }
 
 /* ==== Tìm và GRAB thiết bị ==== */
 static int open_by_name(const char *substr) {
