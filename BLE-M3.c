@@ -1,6 +1,8 @@
-// BLE-M3.c — Bắt đầu theo event11; nhả khi event11 im 500ms.
-// Log: thời điểm bắt đầu (e11 first) + gap giữa các lần event11.
-// PTT tùy chỉnh phím qua biến PTT_KEY.
+// BLE-M3.c — PTT theo event11; chặn event12
+// - Bắt đầu khi thấy event11, nhả khi event11 im > 500 ms
+// - Chặn (grab & nuốt) toàn bộ event12 (BLE-M3 Mouse)
+// - PTT phát 1 phím (tùy chỉnh bằng PTT_KEY)
+// - In log: thời điểm bắt đầu + gap giữa các event11
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -20,18 +22,11 @@
 
 /* ======= TÙY CHỈNH ======= */
 #define DEV_E11_NAME       "BLE-M3 Consumer Control"
-#define E11_QUIET_MS       500     // nhả nếu event11 im > 500 ms
-#define POLL_MS            40      // chu kỳ poll
-#define KEY_DEBOUNCE_MS    15      // chống dội EV_KEY
-#define PTT_KEY            KEY_MEDIA   // 🔧 Phím PTT (HEADSETHOOK)
-/*
-  Một số phím gợi ý khác:
-    KEY_CAMERA       // phím chụp ảnh
-    KEY_F1           // phím F1
-    KEY_PROG1        // phím lập trình (ít dùng)
-    KEY_PLAYPAUSE    // multimedia play/pause
-    KEY_MICMUTE      // tắt mic
-*/
+#define DEV_E12_NAME       "BLE-M3 Mouse"           // sẽ grab & chặn
+#define E11_QUIET_MS       500                      // nhả nếu event11 im > 500 ms
+#define POLL_MS            40                       // chu kỳ poll
+#define KEY_DEBOUNCE_MS    15                       // chống dội EV_KEY
+#define PTT_KEY            KEY_MEDIA                // 🔧 Phím PTT (vd: KEY_MEDIA, KEY_CAMERA, KEY_F1)
 
 /* ======= Tiện ích thời gian ======= */
 static inline long long now_ms(void){
@@ -39,7 +34,7 @@ static inline long long now_ms(void){
   return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000;
 }
 
-/* ======= Mở & GRAB thiết bị ======= */
+/* ======= Mở & GRAB thiết bị theo tên ======= */
 static int open_by_name(const char *substr){
   char path[64], name[256];
   for(int i=0;i<64;i++){
@@ -56,7 +51,7 @@ static int open_by_name(const char *substr){
   return -1;
 }
 
-/* ======= UINPUT setup ======= */
+/* ======= UINPUT: phát 1 phím PTT ======= */
 static int ufd=-1;
 static int uinput_init(void){
   ufd=open("/dev/uinput",O_WRONLY|O_NONBLOCK);
@@ -131,19 +126,29 @@ int main(int argc,char**argv){
 
   if(uinput_init()!=0){ fprintf(stderr,"[BLE-M3] /dev/uinput error\n"); return 1; }
 
+  // Mở & GRAB event11 + event12 (event12 sẽ bị chặn)
   int fd_e11 = open_by_name(DEV_E11_NAME);
+  int fd_e12 = open_by_name(DEV_E12_NAME); // chỉ để chặn
   if(fd_e11<0){
     fprintf(stderr,"[BLE-M3] Không thấy thiết bị '%s'\n", DEV_E11_NAME);
     return 1;
   }
+  if(fd_e12<0){
+    fprintf(stderr,"[BLE-M3] Cảnh báo: Không grab được '%s' (không chặn được event12)\n", DEV_E12_NAME);
+  }
 
-  struct pollfd pfd={fd_e11,POLLIN,0};
+  struct pollfd pfds[2];
+  int nfds = 0;
+  pfds[nfds++] = (struct pollfd){fd_e11, POLLIN, 0};
+  if(fd_e12 >= 0) pfds[nfds++] = (struct pollfd){fd_e12, POLLIN, 0};
+
   struct input_event ev;
 
   while(1){
-    int n = poll(&pfd, 1, POLL_MS);
+    int n = poll(pfds, nfds, POLL_MS);
     long long t = now_ms();
 
+    // đang giữ: nhả nếu im quá 500 ms
     if (st == ST_HOLDING && last_e11_ms>0){
       long long quiet = t - last_e11_ms;
       if (quiet > E11_QUIET_MS){
@@ -156,20 +161,42 @@ int main(int argc,char**argv){
     }
 
     if(n<=0) continue;
-    if(pfd.revents & (POLLERR|POLLHUP|POLLNVAL)){
-      if(ptt_active){ ptt_up(); ptt_active=0; }
-      st = ST_IDLE;
-      start_e11_ms = last_e11_ms = 0;
-      continue;
-    }
-    if(!(pfd.revents & POLLIN)) continue;
 
-    ssize_t r=read(pfd.fd,&ev,sizeof(ev));
-    if(r==sizeof(ev)) on_event11(&ev);
+    for(int i=0;i<nfds;i++){
+      short re = pfds[i].revents;
+      if(!(re & (POLLIN|POLLERR|POLLHUP|POLLNVAL))) continue;
+
+      // nếu thiết bị lỗi/rớt: nhả an toàn
+      if(re & (POLLERR|POLLHUP|POLLNVAL)){
+        if(pfds[i].fd == fd_e11){
+          if(ptt_active){ ptt_up(); ptt_active=0; }
+          st = ST_IDLE;
+          start_e11_ms = last_e11_ms = 0;
+        }
+        continue;
+      }
+
+      ssize_t r = read(pfds[i].fd, &ev, sizeof(ev));
+      if(r != sizeof(ev)) continue;
+
+      if(pfds[i].fd == fd_e11){
+        on_event11(&ev);
+      }else{
+        // fd_e12: CHẶN — đọc rồi bỏ, optional log một lần
+        static int logged = 0;
+        if(!logged){
+          fprintf(stderr,"[BLE-M3] event12 traffic is being blocked.\n");
+          logged = 1;
+        }
+        // không làm gì thêm để sự kiện không lọt ra app khác
+      }
+    }
   }
 
+  // rarely reached
   if(ptt_active){ ptt_up(); }
   if(fd_e11>=0){ ioctl(fd_e11,EVIOCGRAB,0); close(fd_e11); }
+  if(fd_e12>=0){ ioctl(fd_e12,EVIOCGRAB,0); close(fd_e12); }
   if(ufd>=0){ ioctl(ufd,UI_DEV_DESTROY); close(ufd); }
   return 0;
 }
