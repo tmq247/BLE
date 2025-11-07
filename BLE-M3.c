@@ -1,6 +1,6 @@
 // BLE-M3.c — event12 -> đợi event11; event11 giữ PTT; im lặng thì nhả.
 // Log: t(event12), Δt(event12->event11 đầu), gap giữa các lần event11.
-// PTT phát qua KEY_MEDIA + KEY_CAMERA (không dùng phím âm lượng / KEY_FOCUS).
+// PTT chỉ dùng 1 phím: HEADSETHOOK (KEY_MEDIA).
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -49,7 +49,7 @@ static int open_by_name(const char *substr, char *out_path, size_t out_sz){
   return -1;
 }
 
-/* ===== UINPUT: phát KEY_MEDIA + KEY_CAMERA ===== */
+/* ===== UINPUT: chỉ KEY_MEDIA (HEADSETHOOK) ===== */
 static int ufd=-1;
 static int uinput_init(void){
   ufd=open("/dev/uinput",O_WRONLY|O_NONBLOCK);
@@ -57,7 +57,6 @@ static int uinput_init(void){
 
   ioctl(ufd,UI_SET_EVBIT,EV_KEY);
   ioctl(ufd,UI_SET_KEYBIT,KEY_MEDIA);   // HEADSETHOOK (79)
-  ioctl(ufd,UI_SET_KEYBIT,KEY_CAMERA);  // CAMERA (212)
 
   struct uinput_setup us={0};
   us.id.bustype=BUS_USB; us.id.vendor=0x1d6b; us.id.product=0x0104; us.id.version=1;
@@ -65,7 +64,7 @@ static int uinput_init(void){
   if(ioctl(ufd,UI_DEV_SETUP,&us)<0) return -1;
   if(ioctl(ufd,UI_DEV_CREATE,0)<0)  return -1;
   usleep(100*1000);
-  fprintf(stderr,"[BLE-M3] Created uinput PTT device\n");
+  fprintf(stderr,"[BLE-M3] Created uinput PTT device (KEY_MEDIA only)\n");
   return 0;
 }
 
@@ -76,16 +75,8 @@ static void emit_key(int code,int val){
   struct input_event syn={0}; syn.type=EV_SYN; syn.code=SYN_REPORT;
   syn.time.tv_sec=ts.tv_sec; syn.time.tv_usec=ts.tv_nsec/1000; write(ufd,&syn,sizeof(syn));
 }
-static void ptt_down(void){
-  emit_key(KEY_MEDIA,1);
-  emit_key(KEY_CAMERA,1);
-  fprintf(stderr,"[BLE-M3] PTT DOWN (MEDIA + CAMERA)\n");
-}
-static void ptt_up(void){
-  emit_key(KEY_MEDIA,0);
-  emit_key(KEY_CAMERA,0);
-  fprintf(stderr,"[BLE-M3] PTT UP (MEDIA + CAMERA)\n");
-}
+static void ptt_down(void){ emit_key(KEY_MEDIA,1); fprintf(stderr,"[BLE-M3] PTT DOWN (MEDIA)\n"); }
+static void ptt_up(void){ emit_key(KEY_MEDIA,0); fprintf(stderr,"[BLE-M3] PTT UP (MEDIA)\n"); }
 
 /* ===== FSM & mốc thời gian ===== */
 typedef enum { ST_IDLE=0, ST_AWAIT_E11, ST_HOLDING } State;
@@ -99,7 +90,7 @@ static long long last_key_ms  = 0;  // debounce EV_KEY
 
 /* ===== event12: bắt đầu chuỗi chờ e11 ===== */
 static void on_event12(struct input_event *e){
-  // Dùng tín hiệu rõ ràng: BTN_LEFT DOWN để khởi phát
+  // Dùng tín hiệu rõ ràng: BTN_LEFT DOWN để khởi phát (tránh nhiễu REL)
   if(e->type==EV_KEY && e->code==BTN_LEFT && e->value==1){
     e12_start_ms = now_ms();
     first_e11_ms = 0;
